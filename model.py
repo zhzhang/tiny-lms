@@ -105,7 +105,7 @@ class Block(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
-        x = self.attention(self.layer_norm_1(x), cached=self.cached) + x
+        x = self.attention(self.layer_norm_1(x)) + x
         x = self.feed_forward(self.layer_norm_2(x)) + x
         return x
 
@@ -116,6 +116,7 @@ class Model(nn.Module):
         self.config = config
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
+        self.position_embedding = nn.Embedding(config.context_length, config.d_model)
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
 

@@ -198,9 +198,6 @@ with torch.amp.autocast(device_type=device, dtype=torch.bfloat16):
             x, y = train_loader.next_batch()
 
             x, y = x.to(device), y.to(device)
-            if step == 0 and micro_step == 0:
-                decoded = enc.decode(x[0].cpu().tolist())
-                print(f"rank {rank} first example: {decoded}")
             # forward pass
             _, loss = model(x, y)
             total_toks += x.size(0) * x.size(1)
