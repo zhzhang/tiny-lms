@@ -67,47 +67,40 @@ class AttentionHead(nn.Module):
         return output
 
 
-class NewGELU(nn.Module):
-    """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
-
-    def forward(self, input):
-        return (
-            0.5
-            * input
-            * (
-                1.0
-                + torch.tanh(
-                    math.sqrt(2.0 / math.pi)
-                    * (input + 0.044715 * torch.pow(input, 3.0))
-                )
-            )
-        )
-
-
-class FeedForward(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, d_model: int):
         super().__init__()
-        self.input = nn.Linear(d_model, 4 * d_model)
-        self.gelu = NewGELU()
-        self.output = nn.Linear(4 * d_model, d_model)
+        self.input = nn.Linear(d_model, d_model / 2)
+        self.output = nn.Linear(d_model / 2, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input(x)
-        x = self.gelu(x)
+        x = self.gelu(x) 
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.input = nn.Linear(d_model, 2 * d_model)
+        self.output = nn.Linear(d_model, d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input(x)
+        x, gate = x.chunk(2, dim=-1)
+        x = F.silu(gate) * x
         x = self.output(x)
         return x
 
 
 class Block(nn.Module):
     def __init__(
-        self, d_model: int, n_heads: int, context_length: int, cached: bool = False
+        self, config: ModelConfig,
     ):
         super().__init__()
-        self.cached = cached
-        self.layer_norm_1 = nn.LayerNorm(d_model)
-        self.attention = AttentionHead(d_model, n_heads, context_length)
-        self.layer_norm_2 = nn.LayerNorm(d_model)
-        self.feed_forward = FeedForward(d_model)
+        self.layer_norm_1 = nn.LayerNorm(config.d_model)
+        self.attention = AttentionHead(config)
+        self.layer_norm_2 = nn.LayerNorm(config.d_model)
+        self.feed_forward = SwiGLU(config.d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
@@ -124,16 +117,16 @@ class Model(nn.Module):
         self.token_embedding = nn.Embedding(50257, self.d_model)
         self.blocks = nn.ModuleList(
             [
-                Block(self.d_model, self.n_heads, self.context_length)
-                for _ in range(self.n_layers)
+                Block(config)
+                for _ in range(config.n_layers)
             ]
         )
-        self.layer_norm = nn.LayerNorm(self.d_model)
+        self.layer_norm = nn.LayerNorm(config.d_model)
 
         # Ties the token embedding and the output projection.
         # Output of the last transformer layer looks at the entire vocabulary and
         # picks via dot product which token is most likely to come next.
-        self.lm_head = nn.Linear(self.d_model, 50257, bias=False)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.token_embedding.weight = self.lm_head.weight
 
         self.init_rng = torch.Generator()

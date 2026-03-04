@@ -7,7 +7,7 @@ import numpy as np
 import tiktoken
 import torch
 from torch.distributed import init_process_group, destroy_process_group
-from model import GPT
+from model import Model, ModelConfig 
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
@@ -125,7 +125,7 @@ if torch.cuda.is_available():
 
 # init the model, either from scratch or from OpenAI pretrained checkpoint
 
-model = GPT(d_model=768, n_heads=12, n_layers=12, context_length=1024)
+model = Model(ModelConfig(d_model=768, n_heads=12, n_layers=12, context_length=1024))
 model.train()
 model.to(device)
 model = torch.compile(model)
