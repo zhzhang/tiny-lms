@@ -127,9 +127,9 @@ if torch.cuda.is_available():
 
 model = Model(
     ModelConfig(
-        d_model=768,
-        n_attn_groups=8,
-        n_q_per_group=32,
+        d_model=1024,
+        n_attn_groups=4,
+        n_q_per_group=4,
         n_layers=12,
         context_length=1024,
         vocab_size=50257,

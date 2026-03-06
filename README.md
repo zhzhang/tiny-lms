@@ -1,1 +1,1 @@
-curl -fsSL https://raw.githubusercontent.com/zhzhang/gpt2/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/zhzhang/tiny-lms/main/install.sh | sh
