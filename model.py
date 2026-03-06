@@ -50,11 +50,11 @@ class AttentionHead(nn.Module):
         q = q.view(
             batch_size,
             sequence_length,
-            config.n_attn_groups * config.n_q_per_group,
+            config.n_q_heads,
             self.d_head,
         )
-        k = k.view(batch_size, sequence_length, config.n_attn_groups, self.d_head)
-        v = v.view(batch_size, sequence_length, config.n_attn_groups, self.d_head)
+        k = k.view(batch_size, sequence_length, config.n_kv_heads, self.d_head)
+        v = v.view(batch_size, sequence_length, config.n_kv_heads, self.d_head)
         # Swap the sequence length and head dimensions, as we are trying to end up with a sequence_length x sequence_length matrix.
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
