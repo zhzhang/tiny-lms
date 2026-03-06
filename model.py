@@ -9,8 +9,8 @@ from dataclasses import dataclass
 @dataclass
 class ModelConfig:
     d_model: int
-    n_attn_groups: int
-    n_q_per_group: int
+    n_kv_heads: int
+    n_q_heads: int
     n_layers: int
     context_length: int
     vocab_size: int
@@ -21,14 +21,18 @@ class AttentionHead(nn.Module):
 
     def __init__(self, config: ModelConfig):
         super().__init__()
-        assert config.d_model % (config.n_q_per_group * config.n_attn_groups) == 0, (
-            "d_model must be divisible by n_q_per_group * n_attn_groups"
+        assert config.d_model % config.n_q_heads == 0, (
+            "d_model must be divisible by n_q_heads"
+        )
+        assert config.d_model % config.n_kv_heads == 0, (
+            "d_model must be divisible by n_kv_heads"
+        )
+        assert config.n_q_heads % config.n_kv_heads == 0, (
+            "n_q_heads must be divisible by n_kv_heads"
         )
         self.config = config
-
-        self.total_q = config.n_q_per_group * config.n_attn_groups
-        self.d_head = config.d_model // self.total_q
-        self.kv_dim = config.n_attn_groups * self.d_head
+        self.d_head = config.d_model // config.n_q_heads
+        self.kv_dim = config.n_kv_heads * self.d_head
         self.input_projection = nn.Linear(
             config.d_model, config.d_model + 2 * self.kv_dim
         )
@@ -158,7 +162,7 @@ class Model(nn.Module):
             std = (
                 0.02
                 if not hasattr(module, "LLMC_RESIDUAL_SCALE_FLAG")
-                else 0.02 / math.sqrt(2 * self.config.n_layer)
+                else 0.02 / math.sqrt(2 * self.config.n_layers)
             )
             if not hasattr(module, "LLMC_SKIP_INIT"):
                 torch.nn.init.normal_(
@@ -228,9 +232,9 @@ class Model(nn.Module):
 
 if __name__ == "__main__":
     config = ModelConfig(
-        d_model=1024,
-        n_attn_groups=4,
-        n_q_per_group=4,
+        d_model=768,
+        n_kv_heads=12,
+        n_q_heads=12,
         n_layers=12,
         context_length=1024,
         vocab_size=50257,
