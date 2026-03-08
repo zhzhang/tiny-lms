@@ -8,6 +8,7 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 from model import Model, ModelConfig
+from torch import distributed as dist
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -106,6 +107,7 @@ class DistributedDataLoader:
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GPT-style model.")
     parser.add_argument("--train-bin-pattern", type=str, default="fineweb10B/fineweb_train_*.bin")
+    parser.add_argument("--val-bin-pattern", type=str, default="fineweb10B/fineweb_val_*.bin")
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -128,6 +130,7 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default=None)
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-log-interval", type=int, default=1)
+    parser.add_argument("--val-every", type=int, default=0)
     return parser.parse_args()
 
 
@@ -136,6 +139,7 @@ def train(args):
     assert args.grad_accum_steps > 0
     assert args.num_iterations >= 0
     assert args.wandb_log_interval > 0
+    assert args.val_every >= 0
 
     local_rank_env = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
@@ -203,6 +207,11 @@ def train(args):
     train_loader = DistributedDataLoader(
         args.train_bin_pattern, args.batch_size, args.seq_len, rank, world_size
     )
+    val_loader = None
+    if args.val_every > 0:
+        val_loader = DistributedDataLoader(
+            args.val_bin_pattern, args.batch_size, args.seq_len, rank, world_size
+        )
 
     # init the optimizer
     model_for_optim = model.module if is_distributed else model
@@ -294,6 +303,30 @@ def train(args):
                             },
                             step=step + 1,
                         )
+
+                if val_loader is not None and args.val_every > 0 and ((step + 1) % args.val_every == 0):
+                    model.eval()
+                    val_loader.reset()
+                    val_loss_sum = 0.0
+                    with torch.no_grad():
+                        for _ in range(args.grad_accum_steps):
+                            xv, yv = val_loader.next_batch()
+                            xv, yv = xv.to(device), yv.to(device)
+                            _, val_loss = model(xv, yv)
+                            val_loss_sum += float(val_loss.detach())
+                    val_loss_mean = val_loss_sum / args.grad_accum_steps
+
+                    if is_distributed:
+                        val_loss_tensor = torch.tensor(val_loss_mean, device=device)
+                        dist.all_reduce(val_loss_tensor, op=dist.ReduceOp.AVG)
+                        val_loss_mean = float(val_loss_tensor.item())
+
+                    if rank == 0:
+                        print(
+                            f"step {step + 1:4d}/{args.num_iterations} | val loss {val_loss_mean:.6f}"
+                        )
+                        if wandb_run is not None:
+                            wandb_run.log({"val/loss": val_loss_mean}, step=step + 1)
 
                 # keep track of smooth timings, last 20 iterations
                 if step > 0 and step > args.num_iterations - 20:
