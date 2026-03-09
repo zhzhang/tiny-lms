@@ -106,8 +106,12 @@ class DistributedDataLoader:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train GPT-style model.")
-    parser.add_argument("--train-bin-pattern", type=str, default="fineweb10B/fineweb_train_*.bin")
-    parser.add_argument("--val-bin-pattern", type=str, default="fineweb10B/fineweb_val_*.bin")
+    parser.add_argument(
+        "--train-bin-pattern", type=str, default="fineweb10B/fineweb_train_*.bin"
+    )
+    parser.add_argument(
+        "--val-bin-pattern", type=str, default="fineweb10B/fineweb_val_*.bin"
+    )
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=1024)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
@@ -275,7 +279,9 @@ def train(args):
                     # backward pass
                     loss.backward()
                 lossf = lossf.item()
-                norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                norm = torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), args.grad_clip
+                )
                 # determine and set the learning rate for this iteration
                 lr = get_lr(step)
                 for param_group in optimizer.param_groups:
@@ -288,23 +294,28 @@ def train(args):
                 # time and print
                 t1 = time.time()
                 # the 0th iteration is often an outlier (much slower) => skip logging it
-                if rank == 0:
+                if rank == 0 and step > 0:
                     print(
                         f"step {step + 1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1 - t0) * 1000:.2f} ms) | toks/s {total_toks / (t1 - t0):.2f}"
                     )
-                    if wandb_run is not None and ((step + 1) % args.wandb_log_interval == 0):
+                    if wandb_run is not None and (
+                        (step + 1) % args.wandb_log_interval == 0
+                    ):
                         wandb_run.log(
                             {
                                 "train/loss": lossf,
                                 "train/norm": float(norm),
                                 "train/lr": lr,
-                                "train/iter_ms": (t1 - t0) * 1000.0,
                                 "train/toks_per_s": total_toks / (t1 - t0),
                             },
                             step=step + 1,
                         )
 
-                if val_loader is not None and args.val_every > 0 and ((step + 1) % args.val_every == 0):
+                if (
+                    val_loader is not None
+                    and args.val_every > 0
+                    and ((step + 1) % args.val_every == 0)
+                ):
                     model.eval()
                     val_loader.reset()
                     val_loss_sum = 0.0
