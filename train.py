@@ -7,9 +7,11 @@ from contextlib import nullcontext
 
 import numpy as np
 import torch
+from hellaswag import iterate_examples, render_example
 from model import Model, ModelConfig
 from torch import distributed as dist
 from torch.distributed import destroy_process_group, init_process_group
+from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
@@ -135,7 +137,56 @@ def parse_args():
     parser.add_argument("--wandb-run-name", type=str, default=None)
     parser.add_argument("--wandb-log-interval", type=int, default=1)
     parser.add_argument("--val-every", type=int, default=0)
+    parser.add_argument("--eval-every", type=int, default=2000)
     return parser.parse_args()
+
+
+@torch.no_grad()
+def evaluate_hellaswag(model, device, rank, world_size):
+    num_correct_norm = 0
+    num_correct = 0
+    num_total = 0
+
+    for idx, example in enumerate(iterate_examples("val")):
+        # Split eval examples across processes so all ranks do useful work.
+        if idx % world_size != rank:
+            continue
+        _, tokens, mask, label = render_example(example)
+        tokens = tokens.to(device)
+        mask = mask.to(device)
+
+        logits, _ = model(tokens)
+        shift_logits = (logits[..., :-1, :]).contiguous()
+        shift_tokens = (tokens[..., 1:]).contiguous()
+        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_shift_tokens = shift_tokens.view(-1)
+        shift_losses = F.cross_entropy(
+            flat_shift_logits, flat_shift_tokens, reduction="none"
+        )
+        shift_losses = shift_losses.view(tokens.size(0), -1)
+
+        shift_mask = mask[..., 1:].contiguous()
+        masked_shift_losses = shift_losses * shift_mask
+        sum_loss = masked_shift_losses.sum(dim=1)
+        avg_loss = sum_loss / shift_mask.sum(dim=1)
+
+        pred = sum_loss.argmin().item()
+        pred_norm = avg_loss.argmin().item()
+
+        num_total += 1
+        num_correct += int(pred == label)
+        num_correct_norm += int(pred_norm == label)
+
+    counts = torch.tensor(
+        [num_correct, num_correct_norm, num_total], device=device, dtype=torch.long
+    )
+    if world_size > 1:
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
+
+    total = int(counts[2].item())
+    acc = float(counts[0].item()) / total
+    acc_norm = float(counts[1].item()) / total
+    return acc, acc_norm
 
 
 def train(args):
@@ -144,6 +195,7 @@ def train(args):
     assert args.num_iterations >= 0
     assert args.wandb_log_interval > 0
     assert args.val_every >= 0
+    assert args.eval_every >= 0
 
     local_rank_env = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
@@ -338,6 +390,29 @@ def train(args):
                         )
                         if wandb_run is not None:
                             wandb_run.log({"val/loss": val_loss_mean}, step=step + 1)
+
+                if args.eval_every > 0 and ((step + 1) % args.eval_every == 0):
+                    model.eval()
+                    eval_t0 = time.time()
+                    hs_acc, hs_acc_norm = evaluate_hellaswag(
+                        model=model,
+                        device=device,
+                        rank=rank,
+                        world_size=world_size,
+                    )
+                    eval_t1 = time.time()
+                    if rank == 0:
+                        print(
+                            f"step {step + 1:4d}/{args.num_iterations} | hellaswag acc {hs_acc:.4f} | hellaswag acc_norm {hs_acc_norm:.4f} | ({(eval_t1 - eval_t0):.2f} s)"
+                        )
+                        if wandb_run is not None:
+                            wandb_run.log(
+                                {
+                                    "hellaswag/acc": hs_acc,
+                                    "hellaswag/acc_norm": hs_acc_norm,
+                                },
+                                step=step + 1,
+                            )
 
                 # keep track of smooth timings, last 20 iterations
                 if step > 0 and step > args.num_iterations - 20:
