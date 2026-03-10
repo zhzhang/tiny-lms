@@ -192,12 +192,12 @@ class Model(nn.Module):
         targets: Optional[torch.Tensor] = None,
         return_logits: bool = True,
     ) -> torch.Tensor:
-        token_embeds = self.token_embedding(idx)
+        x = self.token_embedding(idx)
         if self.config.position_embedding_type == PositionEmbeddingType.LEARNED:
             position_embeds = self.position_embedding(
                 torch.arange(idx.size(1), dtype=torch.long, device=idx.device)
             )
-            x = token_embeds + position_embeds
+            x = x + position_embeds
 
         for i, block in enumerate(self.blocks):
             x = block(x)
