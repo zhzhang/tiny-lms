@@ -3,7 +3,7 @@
 uv run torchrun --standalone --nproc_per_node=1 train.py \
 --wandb-entity zhuoranjzhang \
 --wandb-project tiny-lms \
---wandb-run-name doc-mask\
+--wandb-run-name doc-mask \
 --intra-doc-mask \
 --n-kv-heads 12 \
 --n-layers 12 \
