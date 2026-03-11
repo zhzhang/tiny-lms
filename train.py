@@ -163,7 +163,8 @@ def make_intra_document_attn_mask(tokens: torch.Tensor, eot_token: int) -> torch
     causal = torch.ones(
         (seq_len, seq_len), device=tokens.device, dtype=torch.bool
     ).tril()
-    return same_doc & causal
+    output = same_doc & causal
+    return output.unsqueeze(1)
 
 
 @torch.no_grad()
