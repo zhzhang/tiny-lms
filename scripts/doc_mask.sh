@@ -8,8 +8,10 @@ uv run torchrun --standalone --nproc_per_node=1 train.py \
 --n-kv-heads 12 \
 --n-layers 12 \
 --val-every 250 \
+--eval-every 500 \
+--checkpoint-every 1000 \
 --num-iterations 18865 \
---batch-size 45 \
+--batch-size 46 \
 --grad-accum-steps 11 \
 --learning-rate 6e-4 \
 --learning-rate-decay-frac 0.0 \

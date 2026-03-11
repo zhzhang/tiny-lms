@@ -239,7 +239,12 @@ class Model(nn.Module):
             [
                 Block(
                     config,
-                    self.rotary_embedding if i % config.rope_skip_freq == 0 else None,
+                    self.rotary_embedding
+                    if (
+                        config.position_embedding_type == PositionEmbeddingType.ROPE
+                        and i % config.rope_skip_freq == 0
+                    )
+                    else None,
                 )
                 for i in range(1, config.n_layers + 1)
             ]
