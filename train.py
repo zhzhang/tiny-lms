@@ -146,7 +146,7 @@ def parse_args():
     parser.add_argument("--val-every", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=2000)
     parser.add_argument("--checkpoint-every", type=int, default=0)
-    parser.add_argument("--intra-document-attention", action="store_true")
+    parser.add_argument("--intra-doc-mask", action="store_true")
     return parser.parse_args()
 
 
@@ -432,7 +432,7 @@ def train(args):
 
                     x, y = x.to(device), y.to(device)
                     attn_mask = None
-                    if args.intra_document_attention:
+                    if args.intra_doc_mask:
                         attn_mask = make_intra_document_attn_mask(x, eot_token_id)
                     # forward pass
                     _, loss = model(x, y, attn_mask=attn_mask)
@@ -491,7 +491,7 @@ def train(args):
                             xv, yv = val_loader.next_batch()
                             xv, yv = xv.to(device), yv.to(device)
                             attn_mask = None
-                            if args.intra_document_attention:
+                            if args.intra_doc_mask:
                                 attn_mask = make_intra_document_attn_mask(
                                     xv, eot_token_id
                                 )
