@@ -50,7 +50,9 @@ class AttentionHead(nn.Module):
         self.output_projection = nn.Linear(config.d_model, config.d_model)
         self.rotary_embedding = rotary_embedding
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         config = self.config
         # X shape is (batch_size, sequence_length, d_model)
         batch_size, sequence_length, _ = x.size()
@@ -73,7 +75,14 @@ class AttentionHead(nn.Module):
             q, k = self.rotary_embedding(q, k)
         v = v.transpose(1, 2)
 
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=True)
+        y = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            is_causal=attn_mask is None,
+            enable_gqa=True,
+        )
         # (batch_size, n_heads, sequence_length, sequence_length)
         output = (
             y.transpose(1, 2)
@@ -143,9 +152,11 @@ class Block(nn.Module):
         # self.feed_forward = SwiGLU(config.d_model)
         self.feed_forward = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         # NOTE: be careful, the residual connection links the input pre layer norm, not post layer norm.
-        x = self.attention(self.layer_norm_1(x)) + x
+        x = self.attention(self.layer_norm_1(x), attn_mask) + x
         x = self.feed_forward(self.layer_norm_2(x)) + x
         return x
 
@@ -268,6 +279,7 @@ class Model(nn.Module):
         self,
         idx: torch.Tensor,
         targets: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
         return_logits: bool = True,
     ) -> torch.Tensor:
         x = self.token_embedding(idx)
@@ -278,7 +290,7 @@ class Model(nn.Module):
             x = x + position_embeds
 
         for i, block in enumerate(self.blocks):
-            x = block(x)
+            x = block(x, attn_mask)
         x = self.layer_norm(x)
 
         loss = None

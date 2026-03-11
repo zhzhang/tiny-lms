@@ -7,6 +7,7 @@ import time
 from contextlib import nullcontext
 
 import numpy as np
+import tiktoken
 import torch
 from hellaswag import iterate_examples, render_example
 from model import Model, ModelConfig, PositionEmbeddingType
@@ -145,7 +146,24 @@ def parse_args():
     parser.add_argument("--val-every", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=2000)
     parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--intra-document-attention", action="store_true")
     return parser.parse_args()
+
+
+def make_intra_document_attn_mask(tokens: torch.Tensor, eot_token: int) -> torch.Tensor:
+    """
+    Builds a boolean attention mask of shape (B, T, T) that is causal and
+    prevents cross-document attention. A new document starts *after* each EOT.
+    """
+    _, seq_len = tokens.shape
+    eot_hits = tokens.eq(eot_token)
+    # Number of EOT delimiters strictly before each position.
+    doc_ids = torch.nn.functional.pad(eot_hits.cumsum(dim=1)[:, :-1], (1, 0), value=0)
+    same_doc = doc_ids[:, :, None].eq(doc_ids[:, None, :])
+    causal = torch.ones(
+        (seq_len, seq_len), device=tokens.device, dtype=torch.bool
+    ).tril()
+    return same_doc & causal
 
 
 @torch.no_grad()
@@ -341,6 +359,9 @@ def train(args):
     )
     model.train()
     model.to(device)
+
+    tokenizer = tiktoken.get_encoding("gpt2")
+    eot_token_id = tokenizer.eot_token
     if not args.no_compile:
         model = torch.compile(model)
 
@@ -410,8 +431,11 @@ def train(args):
                     x, y = train_loader.next_batch()
 
                     x, y = x.to(device), y.to(device)
+                    attn_mask = None
+                    if args.intra_document_attention:
+                        attn_mask = make_intra_document_attn_mask(x, eot_token_id)
                     # forward pass
-                    _, loss = model(x, y)
+                    _, loss = model(x, y, attn_mask=attn_mask)
                     total_toks += x.size(0) * x.size(1)
                     # we have to scale the loss to account for gradient accumulation,
                     # because the gradients just add on each successive backward().
@@ -466,7 +490,12 @@ def train(args):
                         for _ in range(args.grad_accum_steps):
                             xv, yv = val_loader.next_batch()
                             xv, yv = xv.to(device), yv.to(device)
-                            _, val_loss = model(xv, yv)
+                            attn_mask = None
+                            if args.intra_document_attention:
+                                attn_mask = make_intra_document_attn_mask(
+                                    xv, eot_token_id
+                                )
+                            _, val_loss = model(xv, yv, attn_mask=attn_mask)
                             val_loss_sum += float(val_loss.detach())
                     val_loss_mean = val_loss_sum / args.grad_accum_steps
 
