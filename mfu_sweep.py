@@ -20,8 +20,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--d-model-end", type=int, default=4096)
     parser.add_argument("--ctx-start", type=int, default=1024)
     parser.add_argument("--ctx-end", type=int, default=4096)
-    parser.add_argument("--batches-per-size", type=int, default=100)
-    parser.add_argument("--dtype", type=str, default="bf16", choices=["fp32", "fp16", "bf16"])
+    parser.add_argument("--batches-per-size", type=int, default=10)
+    parser.add_argument(
+        "--dtype", type=str, default="bf16", choices=["fp32", "fp16", "bf16"]
+    )
     parser.add_argument(
         "--output-csv",
         type=Path,
@@ -132,7 +134,9 @@ def main() -> None:
 
         for d_model in range(args.d_model_start, args.d_model_end + 1):
             for context_length in range(args.ctx_start, args.ctx_end + 1):
-                print(f"Building+compiling attention head: d_model={d_model}, ctx={context_length}")
+                print(
+                    f"Building+compiling attention head: d_model={d_model}, ctx={context_length}"
+                )
 
                 try:
                     clear_cuda_memory()
@@ -192,6 +196,8 @@ def main() -> None:
                             )
                         f.flush()
                         batch_size += 1
+                        if batch_size > 64:
+                            break
                     except Exception as exc:
                         if is_oom_error(exc):
                             print(

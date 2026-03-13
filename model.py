@@ -24,6 +24,7 @@ class ModelConfig:
     position_embedding_type: PositionEmbeddingType
     rope_skip_freq: int = 2
     rope_theta: float = 10000.0
+    no_bias: bool = False
 
 
 class AttentionHead(nn.Module):
@@ -44,10 +45,14 @@ class AttentionHead(nn.Module):
         self.d_head = config.d_model // config.n_q_heads
         self.kv_dim = config.n_kv_heads * self.d_head
         self.input_projection = nn.Linear(
-            config.d_model, config.d_model + 2 * self.kv_dim
+            config.d_model,
+            config.d_model + 2 * self.kv_dim,
+            bias=not config.no_bias,
         )
 
-        self.output_projection = nn.Linear(config.d_model, config.d_model)
+        self.output_projection = nn.Linear(
+            config.d_model, config.d_model, bias=not config.no_bias
+        )
         self.rotary_embedding = rotary_embedding
 
     def forward(
@@ -94,10 +99,10 @@ class AttentionHead(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, d_model: int):
+    def __init__(self, d_model: int, no_bias: bool = False):
         super().__init__()
-        self.input = nn.Linear(d_model, 2 * d_model)
-        self.output = nn.Linear(d_model, d_model)
+        self.input = nn.Linear(d_model, 2 * d_model, bias=not no_bias)
+        self.output = nn.Linear(d_model, d_model, bias=not no_bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input(x)
@@ -127,9 +132,13 @@ class NewGELU(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.d_model, 4 * config.d_model)
+        self.c_fc = nn.Linear(
+            config.d_model, 4 * config.d_model, bias=not config.no_bias
+        )
         self.gelu = NewGELU()
-        self.c_proj = nn.Linear(4 * config.d_model, config.d_model)
+        self.c_proj = nn.Linear(
+            4 * config.d_model, config.d_model, bias=not config.no_bias
+        )
         self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
 
     def forward(self, x):
@@ -260,6 +269,16 @@ class Model(nn.Module):
         self.init_rng = torch.Generator()
         self.init_rng.manual_seed(42)
         self.apply(self._init_weights)
+        self._validate_no_linear_bias()
+
+    def _validate_no_linear_bias(self):
+        if not self.config.no_bias:
+            return
+        for module_name, module in self.named_modules():
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                raise ValueError(
+                    f"`config.no_bias=True` but linear layer `{module_name}` has bias."
+                )
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
