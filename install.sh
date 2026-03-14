@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPO_URL="${REPO_URL:-https://github.com/zhzhang/gpt2.git}"
+REPO_URL="${REPO_URL:-https://github.com/zhzhang/tiny-lms.git}"
 TARGET_DIR="${TARGET_DIR:-gpt2}"
 
 require_command() {
