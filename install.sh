@@ -2,7 +2,7 @@
 set -eu
 
 REPO_URL="${REPO_URL:-https://github.com/zhzhang/tiny-lms.git}"
-TARGET_DIR="${TARGET_DIR:-gpt2}"
+TARGET_DIR="${TARGET_DIR:-tiny-lms}"
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
