@@ -454,9 +454,7 @@ def train(args):
     )
     val_loader = None
     if args.val_every > 0:
-        val_dataset = get_dataset()
-        if world_size > 1:
-            val_dataset = val_dataset.shard(num_shards=world_size, index=rank)
+        val_dataset = get_dataset().skip(10_000_000)
         val_loader = DataLoader(
             args.batch_size, args.seq_len, val_dataset, args.data_buffer_size
         )
