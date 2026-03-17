@@ -6,6 +6,7 @@ fertility, and PCW for a chosen tokenizer. Default: gpt2 (tiktoken).
 
 import argparse
 from datasets import load_dataset
+from tqdm import tqdm
 
 
 # Dataset: (hf_id, config_name, text_column)
@@ -15,19 +16,24 @@ FINEWEB_EDU = ("HuggingFaceFW/fineweb-edu", "sample-10BT", "text")
 def get_tokenizer(name: str):
     if name == "gpt2":
         import tiktoken
+
         enc = tiktoken.get_encoding("gpt2")
         return lambda s: enc.encode_ordinary(s)
     if name.startswith("gpt2"):
         import tiktoken
+
         enc = tiktoken.get_encoding(name)
         return lambda s: enc.encode_ordinary(s)
     # Hugging Face tokenizers
     from transformers import AutoTokenizer
+
     tok = AutoTokenizer.from_pretrained(name)
     return lambda s: tok.encode(s, add_special_tokens=False)
 
 
-def measure_compression(dataset_id: str, config_name: str | None, text_col: str, tokenize, max_bytes: int):
+def measure_compression(
+    dataset_id: str, config_name: str | None, text_col: str, tokenize, max_bytes: int
+):
     kwargs = {"path": dataset_id, "split": "train", "streaming": True}
     if config_name:
         kwargs["name"] = config_name
@@ -38,7 +44,7 @@ def measure_compression(dataset_id: str, config_name: str | None, text_col: str,
     total_words = 0
     continued_words = 0  # words that tokenize to more than 1 token
 
-    for row in ds:
+    for row in tqdm(ds):
         text = row.get(text_col) or ""
         if not isinstance(text, str):
             continue
@@ -64,13 +70,31 @@ def measure_compression(dataset_id: str, config_name: str | None, text_col: str,
     ratio = total_bytes / total_tokens
     fertility = total_tokens / total_words if total_words else 0.0
     pcw = continued_words / total_words if total_words else 0.0
-    return ratio, (total_bytes, total_tokens, total_words, continued_words, fertility, pcw)
+    return ratio, (
+        total_bytes,
+        total_tokens,
+        total_words,
+        continued_words,
+        fertility,
+        pcw,
+    )
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Measure tokenizer compression on FineWeb-Edu (sample-10BT)")
-    ap.add_argument("--tokenizer", default="gpt2", help="Tokenizer: gpt2 (default), gpt2-50k, or HF model id")
-    ap.add_argument("--max-bytes", type=int, default=10_000_000, help="Max bytes of text to sample (default 10M)")
+    ap = argparse.ArgumentParser(
+        description="Measure tokenizer compression on FineWeb-Edu (sample-10BT)"
+    )
+    ap.add_argument(
+        "--tokenizer",
+        default="gpt2",
+        help="Tokenizer: gpt2 (default), gpt2-50k, or HF model id",
+    )
+    ap.add_argument(
+        "--max-bytes",
+        type=int,
+        default=10_000_000_000,
+        help="Max bytes of text to sample (default 10M)",
+    )
     args = ap.parse_args()
 
     tokenize = get_tokenizer(args.tokenizer)
@@ -90,10 +114,12 @@ def main():
             print(f"  Error: {e}")
             continue
         if ratio is None:
-            print(f"  No text rows.")
+            print("  No text rows.")
             continue
         total_bytes, total_tokens, total_words, continued_words, fertility, pcw = counts
-        print(f"  Bytes: {total_bytes:,}  Tokens: {total_tokens:,}  Words: {total_words:,}")
+        print(
+            f"  Bytes: {total_bytes:,}  Tokens: {total_tokens:,}  Words: {total_words:,}"
+        )
         print(f"  Compression ratio (bytes/token): {ratio:.2f}")
         print(f"  Fertility (tokens/word): {fertility:.3f}")
         print(f"  PCW (proportion of continued words, >1 token): {pcw:.2%}")
