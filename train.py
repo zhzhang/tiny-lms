@@ -22,7 +22,7 @@ DATASETS = [
     ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", 0.4),
     ("mlfoundations/dclm-baseline-1.0", None, "train", 0.4),
     ("HuggingFaceTB/finemath", "finemath-3plus", "train", 0.1),
-    ("HuggingFaceTB/finemath", "infiniwebmath-3plus", "train", 0.1),
+    ("HuggingFaceTB/finemath", "infiwebmath-3plus", "train", 0.1),
 ]
 
 
@@ -31,7 +31,7 @@ def get_dataset():
         load_dataset(namespace, split=split, streaming=True)
         if dataset_name is None
         else load_dataset(namespace, name=dataset_name, split=split, streaming=True)
-        for namespace, dataset_name, split in DATASETS
+        for namespace, dataset_name, split, _ in DATASETS
     ]
     return interleave_datasets(
         hf_datasets, probabilities=[p for _, _, _, p in DATASETS]
