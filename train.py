@@ -1,12 +1,12 @@
 import argparse
-import glob
-import math
 import os
 import re
 import time
+import queue
+import threading
 from contextlib import nullcontext
 
-import numpy as np
+from datasets import load_dataset, interleave_datasets
 import tiktoken
 import torch
 from hellaswag import iterate_examples, render_example
@@ -18,94 +18,133 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
 
+DATASETS = [
+    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", 0.4),
+    ("mlfoundations/dclm-baseline-1.0", None, "train", 0.4),
+    ("HuggingFaceTB/finemath", "finemath-3plus", "train", 0.1),
+    ("HuggingFaceTB/finemath", "infiniwebmath-3plus", "train", 0.1),
+]
 
-def _peek_data_shard(filename):
-    # only reads the header, returns header data
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-    if header[0] != 20240520:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        print("---> HINT: Are you passing in a correct file with --input_bin?")
-        print(
-            "---> HINT: Dataset encoding changed recently, re-run data prepro or refer again to README"
+
+def get_dataset():
+    hf_datasets = [
+        load_dataset(namespace, split=split, streaming=True)
+        if dataset_name is None
+        else load_dataset(namespace, name=dataset_name, split=split, streaming=True)
+        for namespace, dataset_name, split in DATASETS
+    ]
+    return interleave_datasets(
+        hf_datasets, probabilities=[p for _, _, _, p in DATASETS]
+    ).shuffle(seed=42)
+
+
+class DataLoader:
+    def __init__(self, batch_size, seq_len, dataset, buffer_size):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be > 0")
+        if seq_len <= 0:
+            raise ValueError("seq_len must be > 0")
+        if buffer_size <= 0:
+            raise ValueError("buffer_size must be > 0")
+
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.dataset = dataset
+        self.buffer_size = buffer_size
+        self._tokens_per_batch = self.batch_size * self.seq_len + 1
+
+        self._enc = tiktoken.get_encoding("gpt2")
+        self.eot_token = self._enc.eot_token
+
+        self._dataset_iter = iter(self.dataset)
+        self._token_buffer = []
+        self._batch_queue = queue.Queue(maxsize=self.buffer_size)
+        self._stop_event = threading.Event()
+        self._producer_thread = threading.Thread(
+            target=self._producer_loop, daemon=True, name="dataloader-producer"
         )
-        print(
-            "---> HINT: For example re-run: `python dev/data/tinyshakespeare.py`, then re-try"
-        )
-        exit(1)
-    assert header[1] == 1, "unsupported version"
-    ntok = header[2]  # number of tokens (claimed)
-    return ntok  # for now just return the number of tokens
+        self._producer_thread.start()
 
+    def _extract_text(self, sample):
+        if isinstance(sample, str):
+            return sample
+        if isinstance(sample, dict):
+            if "text" in sample and isinstance(sample["text"], str):
+                return sample["text"]
+            raise ValueError("dataset dict samples must include a string 'text' field")
+        raise TypeError("dataset samples must be strings or dicts with a 'text' field")
 
-def _load_data_shard(filename):
-    with open(filename, "rb") as f:
-        # first read the header, which is 256 int32 integers (4 bytes each)
-        header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
-        assert header[0] == 20240520, "magic number mismatch in the data .bin file"
-        assert header[1] == 1, "unsupported version"
-        ntok = header[2]  # number of tokens (claimed)
-        # the rest of it are tokens, stored as uint16
-        tokens = np.frombuffer(f.read(), dtype=np.uint16)
-    assert len(tokens) == ntok, "number of tokens read does not match header?"
-    return tokens
+    def _next_sample(self):
+        while True:
+            try:
+                return next(self._dataset_iter)
+            except StopIteration:
+                # Restart for finite datasets so iteration can continue.
+                self._dataset_iter = iter(self.dataset)
 
+    def _fill_token_buffer(self, min_tokens):
+        while len(self._token_buffer) < min_tokens and not self._stop_event.is_set():
+            sample = self._next_sample()
+            text = self._extract_text(sample)
+            doc_tokens = self._enc.encode_ordinary(text)
+            doc_tokens.append(self.eot_token)
+            self._token_buffer.extend(doc_tokens)
 
-class DistributedDataLoader:
-    def __init__(self, filename_pattern, B, T, process_rank, num_processes):
-        self.process_rank = process_rank
-        self.num_processes = num_processes
-        self.B = B
-        self.T = T
+    def _build_batch(self):
+        self._fill_token_buffer(self._tokens_per_batch)
+        if len(self._token_buffer) < self._tokens_per_batch:
+            raise StopIteration
 
-        # glob files that match the pattern
-        self.files = sorted(glob.glob(filename_pattern))
-        assert len(self.files) > 0, (
-            f"did not find any files that match the pattern {filename_pattern}"
-        )
+        flat = self._token_buffer[: self._tokens_per_batch]
+        self._token_buffer = self._token_buffer[self._tokens_per_batch :]
 
-        # load and validate all data shards, count number of tokens in total
-        ntok_total = 0
-        for fname in self.files:
-            shard_ntok = _peek_data_shard(fname)
-            assert shard_ntok >= num_processes * B * T + 1
-            ntok_total += shard_ntok
-        self.ntok_total = ntok_total
-        print(
-            f"DataLoader: total number of tokens: {ntok_total:,} across {len(self.files)} files"
-        )
+        flat = torch.tensor(flat, dtype=torch.long)
+        x = flat[:-1].view(self.batch_size, self.seq_len)
+        y = flat[1:].view(self.batch_size, self.seq_len)
+        return x, y
 
-        # kick things off
-        self.current_shard = None
-        self.reset()
-
-    def reset(self):
-        # we're being a bit clever here: if we already had shard 0 loaded,
-        # then don't do the work to reload it, just reset the pointer
-        if self.current_shard != 0:
-            self.current_shard = 0
-            self.tokens = _load_data_shard(self.files[self.current_shard])
-        self.current_position = self.process_rank * self.B * self.T
-
-    def advance(self):  # advance to next data shard
-        self.current_shard = (self.current_shard + 1) % len(self.files)
-        self.current_position = self.process_rank * self.B * self.T
-        self.tokens = _load_data_shard(self.files[self.current_shard])
+    def _producer_loop(self):
+        while not self._stop_event.is_set():
+            if self._batch_queue.full():
+                time.sleep(0.005)
+                continue
+            batch = self._build_batch()
+            self._batch_queue.put(batch)
 
     def next_batch(self):
-        B = self.B
-        T = self.T
-        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
-        buf = torch.tensor(buf.astype(np.int32), dtype=torch.long)
-        x = (buf[:-1]).view(B, T)  # inputs
-        y = (buf[1:]).view(B, T)  # targets
-        # advance the start pointer in current shard
-        self.current_position += B * T * self.num_processes
-        # if loading the next batch would be out of bounds advance the shard
-        if self.current_position + (B * T * self.num_processes + 1) > len(self.tokens):
-            self.advance()
-        return x, y
+        if self._stop_event.is_set():
+            raise StopIteration
+        return self.__next__()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        while True:
+            if self._stop_event.is_set() and self._batch_queue.empty():
+                raise StopIteration
+            try:
+                return self._batch_queue.get(timeout=0.1)
+            except queue.Empty:
+                if not self._producer_thread.is_alive():
+                    if self._batch_queue.empty():
+                        raise StopIteration
+
+    def close(self):
+        self._stop_event.set()
+        if self._producer_thread.is_alive():
+            self._producer_thread.join(timeout=1.0)
+
+    def reset(self):
+        self.close()
+        self._stop_event = threading.Event()
+        self._dataset_iter = iter(self.dataset)
+        self._token_buffer = []
+        self._batch_queue = queue.Queue(maxsize=self.buffer_size)
+        self._producer_thread = threading.Thread(
+            target=self._producer_loop, daemon=True, name="dataloader-producer"
+        )
+        self._producer_thread.start()
 
 
 def parse_args():
@@ -118,10 +157,12 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=1024)
+    parser.add_argument("--data-buffer-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--learning-rate-decay-frac", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.1)
     parser.add_argument("--warmup-iters", type=int, default=0)
+    parser.add_argument("--decay-steps", type=int, default=0)
     parser.add_argument("--num-iterations", type=int, default=20000)
     parser.add_argument("--grad-accum-steps", type=int, default=50)
     parser.add_argument("--grad-clip", type=float, default=1.0)
@@ -289,6 +330,37 @@ def _save_checkpoint_if_needed(
     )
 
 
+def get_wsd_lr(
+    it,
+    *,
+    learning_rate,
+    min_lr,
+    warmup_iters,
+    num_iterations,
+    decay_steps,
+):
+    # 1) linear warmup for warmup_iters steps
+    if warmup_iters > 0 and it < warmup_iters:
+        return learning_rate * (it + 1) / warmup_iters
+
+    # 2) if it is beyond the schedule horizon, keep the minimum learning rate
+    if it > num_iterations:
+        return min_lr
+
+    # 3) optional stable plateau if decay starts near the end
+    if decay_steps <= 0:
+        return learning_rate
+    decay_start = max(num_iterations - decay_steps, warmup_iters)
+    if it < decay_start:
+        return learning_rate
+
+    # 4) linearly decay to min_lr in the final decay region
+    decay_denom = max(num_iterations - decay_start, 1)
+    decay_ratio = (it - decay_start) / decay_denom
+    decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+    return learning_rate - decay_ratio * (learning_rate - min_lr)
+
+
 def train(args):
     assert 1 <= args.seq_len <= args.max_sequence_length
     assert args.grad_accum_steps > 0
@@ -297,6 +369,7 @@ def train(args):
     assert args.val_every >= 0
     assert args.eval_every >= 0
     assert args.checkpoint_every >= 0
+    assert args.decay_steps >= 0
 
     local_rank_env = os.environ.get("LOCAL_RANK")
     world_size_env = os.environ.get("WORLD_SIZE")
@@ -372,14 +445,20 @@ def train(args):
         else:
             model = DDP(model)
 
-    # load tokens
-    train_loader = DistributedDataLoader(
-        args.train_bin_pattern, args.batch_size, args.seq_len, rank, world_size
+    # load dataset and stream-tokenize into packed batches
+    train_dataset = get_dataset()
+    if world_size > 1:
+        train_dataset = train_dataset.shard(num_shards=world_size, index=rank)
+    train_loader = DataLoader(
+        args.batch_size, args.seq_len, train_dataset, args.data_buffer_size
     )
     val_loader = None
     if args.val_every > 0:
-        val_loader = DistributedDataLoader(
-            args.val_bin_pattern, args.batch_size, args.seq_len, rank, world_size
+        val_dataset = get_dataset()
+        if world_size > 1:
+            val_dataset = val_dataset.shard(num_shards=world_size, index=rank)
+        val_loader = DataLoader(
+            args.batch_size, args.seq_len, val_dataset, args.data_buffer_size
         )
 
     # init the optimizer
@@ -391,23 +470,7 @@ def train(args):
         zero_stage=0,
     )
 
-    # learning rate decay scheduler (cosine with warmup)
-    def get_lr(it):
-        min_lr = args.learning_rate * args.learning_rate_decay_frac
-        # 1) linear warmup for warmup_iters steps
-        if args.warmup_iters > 0 and it < args.warmup_iters:
-            return args.learning_rate * (it + 1) / args.warmup_iters
-        # 2) if it > lr_decay_iters, return min learning rate
-        if it > args.num_iterations:
-            return min_lr
-        # 3) in between, use cosine decay down to min learning rate
-        denom = max(args.num_iterations - args.warmup_iters, 1)
-        decay_ratio = (it - args.warmup_iters) / denom
-        decay_ratio = min(max(decay_ratio, 0.0), 1.0)
-        coeff = 0.5 * (
-            1.0 + math.cos(math.pi * decay_ratio)
-        )  # coeff starts at 1 and goes to 0
-        return min_lr + coeff * (args.learning_rate - min_lr)
+    min_lr = args.learning_rate * args.learning_rate_decay_frac
 
     timings = []
     norm = -1.0  # dummy value to print in inference-only mode
@@ -451,7 +514,14 @@ def train(args):
                     model.parameters(), args.grad_clip
                 )
                 # determine and set the learning rate for this iteration
-                lr = get_lr(step)
+                lr = get_wsd_lr(
+                    step,
+                    learning_rate=args.learning_rate,
+                    min_lr=min_lr,
+                    warmup_iters=args.warmup_iters,
+                    num_iterations=args.num_iterations,
+                    decay_steps=args.decay_steps,
+                )
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
                 # step the optimizer
