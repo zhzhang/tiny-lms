@@ -2,13 +2,11 @@ import argparse
 import os
 import re
 import time
-import queue
-import threading
 from contextlib import nullcontext
 
-from datasets import load_dataset, interleave_datasets
 import tiktoken
 import torch
+from dataloader import DataLoader, get_dataset
 from hellaswag import iterate_examples, render_example
 from model import Model, ModelConfig, PositionEmbeddingType
 from torch import distributed as dist
@@ -17,134 +15,6 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
-
-DATASETS = [
-    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", 0.4),
-    ("mlfoundations/dclm-baseline-1.0", None, "train", 0.4),
-    ("HuggingFaceTB/finemath", "finemath-3plus", "train", 0.1),
-    ("HuggingFaceTB/finemath", "infiwebmath-3plus", "train", 0.1),
-]
-
-
-def get_dataset():
-    hf_datasets = [
-        load_dataset(namespace, split=split, streaming=True)
-        if dataset_name is None
-        else load_dataset(namespace, name=dataset_name, split=split, streaming=True)
-        for namespace, dataset_name, split, _ in DATASETS
-    ]
-    return interleave_datasets(
-        hf_datasets, probabilities=[p for _, _, _, p in DATASETS]
-    ).shuffle(seed=42)
-
-
-class DataLoader:
-    def __init__(self, batch_size, seq_len, dataset, buffer_size):
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if seq_len <= 0:
-            raise ValueError("seq_len must be > 0")
-        if buffer_size <= 0:
-            raise ValueError("buffer_size must be > 0")
-
-        self.batch_size = batch_size
-        self.seq_len = seq_len
-        self.dataset = dataset
-        self.buffer_size = buffer_size
-        self._tokens_per_batch = self.batch_size * self.seq_len + 1
-
-        self._enc = tiktoken.get_encoding("gpt2")
-        self.eot_token = self._enc.eot_token
-
-        self._dataset_iter = iter(self.dataset)
-        self._token_buffer = []
-        self._batch_queue = queue.Queue(maxsize=self.buffer_size)
-        self._stop_event = threading.Event()
-        self._producer_thread = threading.Thread(
-            target=self._producer_loop, daemon=True, name="dataloader-producer"
-        )
-        self._producer_thread.start()
-
-    def _extract_text(self, sample):
-        if isinstance(sample, str):
-            return sample
-        if isinstance(sample, dict):
-            if "text" in sample and isinstance(sample["text"], str):
-                return sample["text"]
-            raise ValueError("dataset dict samples must include a string 'text' field")
-        raise TypeError("dataset samples must be strings or dicts with a 'text' field")
-
-    def _next_sample(self):
-        while True:
-            try:
-                return next(self._dataset_iter)
-            except StopIteration:
-                # Restart for finite datasets so iteration can continue.
-                self._dataset_iter = iter(self.dataset)
-
-    def _fill_token_buffer(self, min_tokens):
-        while len(self._token_buffer) < min_tokens and not self._stop_event.is_set():
-            sample = self._next_sample()
-            text = self._extract_text(sample)
-            doc_tokens = self._enc.encode_ordinary(text)
-            doc_tokens.append(self.eot_token)
-            self._token_buffer.extend(doc_tokens)
-
-    def _build_batch(self):
-        self._fill_token_buffer(self._tokens_per_batch)
-        if len(self._token_buffer) < self._tokens_per_batch:
-            raise StopIteration
-
-        flat = self._token_buffer[: self._tokens_per_batch]
-        self._token_buffer = self._token_buffer[self._tokens_per_batch :]
-
-        flat = torch.tensor(flat, dtype=torch.long)
-        x = flat[:-1].view(self.batch_size, self.seq_len)
-        y = flat[1:].view(self.batch_size, self.seq_len)
-        return x, y
-
-    def _producer_loop(self):
-        while not self._stop_event.is_set():
-            if self._batch_queue.full():
-                time.sleep(0.005)
-                continue
-            batch = self._build_batch()
-            self._batch_queue.put(batch)
-
-    def next_batch(self):
-        if self._stop_event.is_set():
-            raise StopIteration
-        return self.__next__()
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        while True:
-            if self._stop_event.is_set() and self._batch_queue.empty():
-                raise StopIteration
-            try:
-                return self._batch_queue.get(timeout=0.1)
-            except queue.Empty:
-                if not self._producer_thread.is_alive():
-                    if self._batch_queue.empty():
-                        raise StopIteration
-
-    def close(self):
-        self._stop_event.set()
-        if self._producer_thread.is_alive():
-            self._producer_thread.join(timeout=1.0)
-
-    def reset(self):
-        self.close()
-        self._stop_event = threading.Event()
-        self._dataset_iter = iter(self.dataset)
-        self._token_buffer = []
-        self._batch_queue = queue.Queue(maxsize=self.buffer_size)
-        self._producer_thread = threading.Thread(
-            target=self._producer_loop, daemon=True, name="dataloader-producer"
-        )
-        self._producer_thread.start()
 
 
 def parse_args():
@@ -490,7 +360,7 @@ def train(args):
                 total_toks = 0
                 for micro_step in range(args.grad_accum_steps):
                     # fetch a batch
-                    x, y = train_loader.next_batch()
+                    x, y = next(train_loader)
 
                     x, y = x.to(device), y.to(device)
                     attn_mask = None
@@ -557,7 +427,7 @@ def train(args):
                     val_loss_sum = 0.0
                     with torch.no_grad():
                         for _ in range(args.grad_accum_steps):
-                            xv, yv = val_loader.next_batch()
+                            xv, yv = next(val_loader)
                             xv, yv = xv.to(device), yv.to(device)
                             attn_mask = None
                             if args.intra_doc_mask:
