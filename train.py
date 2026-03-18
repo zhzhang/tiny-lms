@@ -7,11 +7,10 @@ from contextlib import nullcontext
 import tiktoken
 import torch
 from dataloader import DataLoader, get_dataset
-from hellaswag import iterate_examples, render_example
+import lm_eval
 from model import Model, ModelConfig, PositionEmbeddingType
 from torch import distributed as dist
 from torch.distributed import destroy_process_group, init_process_group
-from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 torch.autograd.set_detect_anomaly(True)
@@ -76,91 +75,6 @@ def make_intra_document_attn_mask(tokens: torch.Tensor, eot_token: int) -> torch
     ).tril()
     output = same_doc & causal
     return output.unsqueeze(1)
-
-
-@torch.no_grad()
-def evaluate_hellaswag(model, device, rank, world_size):
-    num_correct_norm = 0
-    num_correct = 0
-    num_total = 0
-
-    for idx, example in enumerate(iterate_examples("val")):
-        # Split eval examples across processes so all ranks do useful work.
-        if idx % world_size != rank:
-            continue
-        _, tokens, mask, label = render_example(example)
-        tokens = tokens.to(device)
-        mask = mask.to(device)
-
-        logits, _ = model(tokens)
-        shift_logits = (logits[..., :-1, :]).contiguous()
-        shift_tokens = (tokens[..., 1:]).contiguous()
-        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
-        flat_shift_tokens = shift_tokens.view(-1)
-        shift_losses = F.cross_entropy(
-            flat_shift_logits, flat_shift_tokens, reduction="none"
-        )
-        shift_losses = shift_losses.view(tokens.size(0), -1)
-
-        shift_mask = mask[..., 1:].contiguous()
-        masked_shift_losses = shift_losses * shift_mask
-        sum_loss = masked_shift_losses.sum(dim=1)
-        avg_loss = sum_loss / shift_mask.sum(dim=1)
-
-        pred = sum_loss.argmin().item()
-        pred_norm = avg_loss.argmin().item()
-
-        num_total += 1
-        num_correct += int(pred == label)
-        num_correct_norm += int(pred_norm == label)
-
-    counts = torch.tensor(
-        [num_correct, num_correct_norm, num_total], device=device, dtype=torch.long
-    )
-    if world_size > 1:
-        dist.all_reduce(counts, op=dist.ReduceOp.SUM)
-
-    total = int(counts[2].item())
-    acc = float(counts[0].item()) / total
-    acc_norm = float(counts[1].item()) / total
-    return acc, acc_norm
-
-
-def _run_hellaswag_eval_if_needed(
-    *,
-    step,
-    args,
-    model,
-    device,
-    rank,
-    world_size,
-    wandb_run,
-):
-    if args.eval_every <= 0 or (step + 1) % args.eval_every != 0:
-        return
-
-    model.eval()
-    eval_t0 = time.time()
-    hs_acc, hs_acc_norm = evaluate_hellaswag(
-        model=model,
-        device=device,
-        rank=rank,
-        world_size=world_size,
-    )
-    eval_t1 = time.time()
-
-    if rank == 0:
-        print(
-            f"step {step + 1:4d}/{args.num_iterations} | hellaswag acc {hs_acc:.4f} | hellaswag acc_norm {hs_acc_norm:.4f} | ({(eval_t1 - eval_t0):.2f} s)"
-        )
-        if wandb_run is not None:
-            wandb_run.log(
-                {
-                    "hellaswag/acc": hs_acc,
-                    "hellaswag/acc_norm": hs_acc_norm,
-                },
-                step=step + 1,
-            )
 
 
 def _save_checkpoint_if_needed(
@@ -450,15 +364,11 @@ def train(args):
                         if wandb_run is not None:
                             wandb_run.log({"val/loss": val_loss_mean}, step=step + 1)
 
-                _run_hellaswag_eval_if_needed(
-                    step=step,
-                    args=args,
-                    model=model,
-                    device=device,
-                    rank=rank,
-                    world_size=world_size,
-                    wandb_run=wandb_run,
-                )
+                if args.eval_every > 0 and ((step + 1) % args.eval_every == 0):
+                    lm_eval.simple_evaluate(
+                        model=model,
+                        tasks=["mmlu"],
+                    )
 
                 _save_checkpoint_if_needed(
                     step=step,
