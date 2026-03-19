@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import time
+from collections import deque
 from contextlib import nullcontext
 
 import tiktoken
@@ -145,6 +146,43 @@ def get_wsd_lr(
     return learning_rate - decay_ratio * (learning_rate - min_lr)
 
 
+ROLLING_METRIC_WINDOW = 100
+ROLLING_OUTLIER_FRAC = 0.2
+OUTLIER_LOG_PATH = "outlier_batches.log"
+
+
+def _is_outside_rolling_window(value: float, history: deque, *, frac: float) -> bool:
+    """True if value lies more than ``frac`` times the span beyond min/max of history."""
+    if len(history) < history.maxlen:
+        return False
+    lo, hi = min(history), max(history)
+    span = max(hi - lo, 1e-12)
+    margin = frac * span
+    return value < lo - margin or value > hi + margin
+
+
+def _log_outlier_batches(
+    path: str,
+    *,
+    step_display: int,
+    lossf: float,
+    grad_norm: float,
+    tokenizer,
+    batch_xs: list,
+) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"\n{'=' * 72}\n")
+        f.write(
+            f"step {step_display} | loss {lossf:.6f} | grad_norm {grad_norm:.6f}\n"
+        )
+        for mi, x_cpu in enumerate(batch_xs):
+            f.write(f"\n--- micro_batch {mi} ---\n")
+            for b in range(x_cpu.shape[0]):
+                ids = x_cpu[b].tolist()
+                text = tokenizer.decode(ids)
+                f.write(f"[sample {b}]\n{text}\n")
+
+
 def train(args):
     assert 1 <= args.seq_len <= args.max_sequence_length
     assert args.grad_accum_steps > 0
@@ -256,6 +294,11 @@ def train(args):
 
     timings = []
     norm = -1.0  # dummy value to print in inference-only mode
+    loss_history: deque[float] = deque(maxlen=ROLLING_METRIC_WINDOW)
+    norm_history: deque[float] = deque(maxlen=ROLLING_METRIC_WINDOW)
+    smooth_loss = None
+    smooth_norm = None
+    smooth_beta = 0.95
     autocast_context = (
         torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
         if device_type == "cuda"
@@ -272,9 +315,13 @@ def train(args):
                 # micro-batch loop where we do gradient accumulation to reach desired total batch size
                 lossf = 0.0  # for getting the mean loss (as simple float) over the accumulation steps
                 total_toks = 0
+                batch_xs_for_log: list = []
+                clone_batches_for_log = rank == 0 and len(loss_history) == ROLLING_METRIC_WINDOW
                 for micro_step in range(args.grad_accum_steps):
                     # fetch a batch
                     x, y = next(train_loader)
+                    if clone_batches_for_log:
+                        batch_xs_for_log.append(x.detach().cpu().clone())
 
                     x, y = x.to(device), y.to(device)
                     attn_mask = None
@@ -295,6 +342,35 @@ def train(args):
                 norm = torch.nn.utils.clip_grad_norm_(
                     model.parameters(), args.grad_clip
                 )
+                norm_f = float(norm)
+                smooth_loss = (
+                    lossf
+                    if smooth_loss is None
+                    else smooth_beta * smooth_loss + (1.0 - smooth_beta) * lossf
+                )
+                smooth_norm = (
+                    norm_f
+                    if smooth_norm is None
+                    else smooth_beta * smooth_norm + (1.0 - smooth_beta) * norm_f
+                )
+                if rank == 0:
+                    loss_out = _is_outside_rolling_window(
+                        smooth_loss, loss_history, frac=ROLLING_OUTLIER_FRAC
+                    )
+                    norm_out = _is_outside_rolling_window(
+                        smooth_norm, norm_history, frac=ROLLING_OUTLIER_FRAC
+                    )
+                    if loss_out or norm_out:
+                        _log_outlier_batches(
+                            OUTLIER_LOG_PATH,
+                            step_display=step + 1,
+                            lossf=lossf,
+                            grad_norm=norm_f,
+                            tokenizer=tokenizer,
+                            batch_xs=batch_xs_for_log,
+                        )
+                    loss_history.append(smooth_loss)
+                    norm_history.append(smooth_norm)
                 # determine and set the learning rate for this iteration
                 lr = get_wsd_lr(
                     step,
