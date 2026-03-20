@@ -169,12 +169,38 @@ def _log_outlier_batches(
     grad_norm: float,
     tokenizer,
     batch_xs: list,
+    model,
+    is_distributed: bool,
+    optimizer,
+    args,
 ) -> None:
+    checkpoint_dir = os.path.splitext(path)[0]
+    checkpoint_path = os.path.join(
+        checkpoint_dir, f"step_{step_display:06d}_outlier.pt"
+    )
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
+    checkpoint_model = model.module if is_distributed else model
+    checkpoint_model = getattr(checkpoint_model, "_orig_mod", checkpoint_model)
+    torch.save(
+        {
+            "step": step_display,
+            "loss": lossf,
+            "grad_norm": grad_norm,
+            "outlier_batch_xs": batch_xs,
+            "model_state_dict": checkpoint_model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "args": vars(args),
+        },
+        checkpoint_path,
+    )
+
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"\n{'=' * 72}\n")
         f.write(
             f"step {step_display} | loss {lossf:.6f} | grad_norm {grad_norm:.6f}\n"
         )
+        f.write(f"checkpoint {checkpoint_path}\n")
         for mi, x_cpu in enumerate(batch_xs):
             f.write(f"\n--- micro_batch {mi} ---\n")
             for b in range(x_cpu.shape[0]):
@@ -368,6 +394,10 @@ def train(args):
                             grad_norm=norm_f,
                             tokenizer=tokenizer,
                             batch_xs=batch_xs_for_log,
+                            model=model,
+                            is_distributed=is_distributed,
+                            optimizer=optimizer,
+                            args=args,
                         )
                     loss_history.append(smooth_loss)
                     norm_history.append(smooth_norm)
