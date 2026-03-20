@@ -1,5 +1,6 @@
 import queue
 import threading
+from collections import Counter
 
 import tiktoken
 import torch
@@ -23,15 +24,24 @@ def get_dataset():
     for i, ds in enumerate(hf_datasets):
         cols_to_remove = [c for c in ds.column_names if c != "text"]
         if cols_to_remove:
-            hf_datasets[i] = ds.remove_columns(cols_to_remove)
+            hf_datasets[i] = ds.remove_columns(cols_to_remove).map(
+                lambda x: {**x, "source": DATASETS[i][0]}
+            )
     print("Interleaving datasets...")
-    out = interleave_datasets(
-        hf_datasets, probabilities=[p for _, _, _, p in DATASETS]
-    )
+    out = interleave_datasets(hf_datasets, probabilities=[p for _, _, _, p in DATASETS])
     print("Shuffling dataset...")
     out = out.shuffle(seed=42)
     print("Done")
     return out
+
+
+def _format_source_proportions(source_proportions):
+    if not source_proportions:
+        return "unknown=1.000"
+    return " | ".join(
+        f"{source}={proportion:.3f}"
+        for source, proportion in sorted(source_proportions.items())
+    )
 
 
 class DataLoader:
@@ -54,6 +64,7 @@ class DataLoader:
 
         self._dataset_iter = iter(self.dataset)
         self._token_buffer = []
+        self._source_buffer = []
         self._sample_queue = queue.Queue(maxsize=8)
         self._batch_queue = queue.Queue(maxsize=self.buffer_size)
         self._stop_event = threading.Event()
@@ -66,12 +77,12 @@ class DataLoader:
         self._fetcher_thread.start()
         self._producer_thread.start()
 
-    def _extract_text(self, sample):
+    def _extract_text_and_source(self, sample):
         if isinstance(sample, str):
-            return sample
+            return sample, "unknown"
         if isinstance(sample, dict):
             if "text" in sample and isinstance(sample["text"], str):
-                return sample["text"]
+                return sample["text"], sample.get("source", "unknown")
             raise ValueError("dataset dict samples must include a string 'text' field")
         raise TypeError("dataset samples must be strings or dicts with a 'text' field")
 
@@ -102,10 +113,11 @@ class DataLoader:
                 continue
             if sample is self._SAMPLE_END:
                 return
-            text = self._extract_text(sample)
+            text, source = self._extract_text_and_source(sample)
             doc_tokens = self._enc.encode_ordinary(text)
             doc_tokens.append(self.eot_token)
             self._token_buffer.extend(doc_tokens)
+            self._source_buffer.extend([source] * len(doc_tokens))
 
     def _build_batch(self):
         self._fill_token_buffer(self._tokens_per_batch)
@@ -113,12 +125,20 @@ class DataLoader:
             raise StopIteration
 
         flat = self._token_buffer[: self._tokens_per_batch]
+        flat_sources = self._source_buffer[: self._tokens_per_batch]
         self._token_buffer = self._token_buffer[self._tokens_per_batch :]
+        self._source_buffer = self._source_buffer[self._tokens_per_batch :]
 
         flat = torch.tensor(flat, dtype=torch.long)
         x = flat[:-1].view(self.batch_size, self.seq_len)
         y = flat[1:].view(self.batch_size, self.seq_len)
-        return x, y
+        source_counts = Counter(flat_sources[:-1])
+        total_tokens = max(sum(source_counts.values()), 1)
+        source_proportions = {
+            source: count / total_tokens
+            for source, count in sorted(source_counts.items())
+        }
+        return x, y, source_proportions
 
     def _producer_loop(self):
         try:
@@ -137,7 +157,11 @@ class DataLoader:
             if self._stop_event.is_set() and self._batch_queue.empty():
                 raise StopIteration
             try:
-                return self._batch_queue.get(timeout=0.1)
+                x, y, source_proportions = self._batch_queue.get(timeout=0.1)
+                print(
+                    f"batch sources {_format_source_proportions(source_proportions)}"
+                )
+                return x, y
             except queue.Empty:
                 if not self._producer_thread.is_alive():
                     if self._batch_queue.empty():
@@ -155,6 +179,7 @@ class DataLoader:
         self._stop_event = threading.Event()
         self._dataset_iter = iter(self.dataset)
         self._token_buffer = []
+        self._source_buffer = []
         self._sample_queue = queue.Queue(maxsize=8)
         self._batch_queue = queue.Queue(maxsize=self.buffer_size)
         self._fetcher_thread = threading.Thread(
