@@ -22,11 +22,11 @@ def get_dataset():
         for namespace, dataset_name, split, _ in DATASETS
     ]
     for i, ds in enumerate(hf_datasets):
+        source = f"{DATASETS[i][0]}-{DATASETS[i][1]}"
         cols_to_remove = [c for c in ds.column_names if c != "text"]
         if cols_to_remove:
-            hf_datasets[i] = ds.remove_columns(cols_to_remove).map(
-                lambda x: {**x, "source": DATASETS[i][0]}
-            )
+            ds = ds.remove_columns(cols_to_remove)
+        hf_datasets[i] = ds.map(lambda x, source=source: {**x, "source": source})
     print("Interleaving datasets...")
     out = interleave_datasets(hf_datasets, probabilities=[p for _, _, _, p in DATASETS])
     print("Shuffling dataset...")
@@ -158,9 +158,7 @@ class DataLoader:
                 raise StopIteration
             try:
                 x, y, source_proportions = self._batch_queue.get(timeout=0.1)
-                print(
-                    f"batch sources {_format_source_proportions(source_proportions)}"
-                )
+                print(f"batch sources {_format_source_proportions(source_proportions)}")
                 return x, y
             except queue.Empty:
                 if not self._producer_thread.is_alive():
