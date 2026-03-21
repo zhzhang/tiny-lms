@@ -147,7 +147,7 @@ def get_wsd_lr(
 
 
 ROLLING_METRIC_WINDOW = 100
-ROLLING_OUTLIER_FRAC = 0.2
+ROLLING_OUTLIER_FRAC = 0.1
 OUTLIER_LOG_PATH = "outlier_batches.log"
 
 
@@ -197,9 +197,7 @@ def _log_outlier_batches(
 
     with open(path, "a", encoding="utf-8") as f:
         f.write(f"\n{'=' * 72}\n")
-        f.write(
-            f"step {step_display} | loss {lossf:.6f} | grad_norm {grad_norm:.6f}\n"
-        )
+        f.write(f"step {step_display} | loss {lossf:.6f} | grad_norm {grad_norm:.6f}\n")
         f.write(f"checkpoint {checkpoint_path}\n")
         for mi, x_cpu in enumerate(batch_xs):
             f.write(f"\n--- micro_batch {mi} ---\n")
@@ -322,9 +320,6 @@ def train(args):
     norm = -1.0  # dummy value to print in inference-only mode
     loss_history: deque[float] = deque(maxlen=ROLLING_METRIC_WINDOW)
     norm_history: deque[float] = deque(maxlen=ROLLING_METRIC_WINDOW)
-    smooth_loss = None
-    smooth_norm = None
-    smooth_beta = 0.95
     autocast_context = (
         torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
         if device_type == "cuda"
@@ -342,12 +337,11 @@ def train(args):
                 lossf = 0.0  # for getting the mean loss (as simple float) over the accumulation steps
                 total_toks = 0
                 batch_xs_for_log: list = []
-                clone_batches_for_log = rank == 0 and len(loss_history) == ROLLING_METRIC_WINDOW
+
                 for micro_step in range(args.grad_accum_steps):
                     # fetch a batch
                     x, y = next(train_loader)
-                    if clone_batches_for_log:
-                        batch_xs_for_log.append(x.detach().cpu().clone())
+                    batch_xs_for_log.append(x.detach().cpu().clone())
 
                     x, y = x.to(device), y.to(device)
                     attn_mask = None
@@ -369,22 +363,12 @@ def train(args):
                     model.parameters(), args.grad_clip
                 )
                 norm_f = float(norm)
-                smooth_loss = (
-                    lossf
-                    if smooth_loss is None
-                    else smooth_beta * smooth_loss + (1.0 - smooth_beta) * lossf
-                )
-                smooth_norm = (
-                    norm_f
-                    if smooth_norm is None
-                    else smooth_beta * smooth_norm + (1.0 - smooth_beta) * norm_f
-                )
                 if rank == 0:
                     loss_out = _is_outside_rolling_window(
-                        smooth_loss, loss_history, frac=ROLLING_OUTLIER_FRAC
+                        lossf, loss_history, frac=ROLLING_OUTLIER_FRAC
                     )
                     norm_out = _is_outside_rolling_window(
-                        smooth_norm, norm_history, frac=ROLLING_OUTLIER_FRAC
+                        norm_f, norm_history, frac=ROLLING_OUTLIER_FRAC
                     )
                     if loss_out or norm_out:
                         _log_outlier_batches(
@@ -399,8 +383,8 @@ def train(args):
                             optimizer=optimizer,
                             args=args,
                         )
-                    loss_history.append(smooth_loss)
-                    norm_history.append(smooth_norm)
+                    loss_history.append(lossf)
+                    norm_history.append(norm_f)
                 # determine and set the learning rate for this iteration
                 lr = get_wsd_lr(
                     step,
