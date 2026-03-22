@@ -112,14 +112,6 @@ def token_text(tokenizer, token_id: int) -> str:
     return escape_text(tokenizer.decode([token_id]))
 
 
-def build_targets_from_x(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    flat_x = x.reshape(-1)
-    flat_y = flat_x.new_full(flat_x.shape, -1)
-    flat_y[:-1] = flat_x[1:]
-    valid = flat_y.ne(-1)
-    return flat_y.view_as(x), valid.view_as(x)
-
-
 def analyze_checkpoint(
     checkpoint_path: Path, top_k: int, context_window: int, output_path: str | None
 ) -> None:
@@ -128,48 +120,47 @@ def analyze_checkpoint(
     tokenizer = tiktoken.get_encoding("gpt2")
     eot_token_id = tokenizer.eot_token
     saved_args = checkpoint["args"]
-    batch_xs = checkpoint["outlier_batch_xs"]
+    batch_contents = checkpoint.get("outlier_batch_contents")
 
     rows: list[dict[str, Any]] = []
-    print(batch_xs)
-    with torch.no_grad():
-        for micro_batch_idx, x_cpu in enumerate(batch_xs):
-            x = x_cpu.to(dtype=torch.long, device="cpu")
-            targets, valid_mask = build_targets_from_x(x)
-            attn_mask = None
-            if saved_args.get("intra_doc_mask", False):
-                attn_mask = make_intra_document_attn_mask(x, eot_token_id)
+    for micro_batch_idx, (x_cpu, y_cpu) in enumerate(batch_contents):
+        x = x_cpu.to(dtype=torch.long, device="cpu")
+        targets = y_cpu.to(dtype=torch.long, device="cpu")
+        valid_mask = targets.ne(-1)
+        attn_mask = None
+        if saved_args.get("intra_doc_mask", False):
+            attn_mask = make_intra_document_attn_mask(x, eot_token_id)
 
-            logits, _ = model(x, attn_mask=attn_mask)
-            token_losses = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                reduction="none",
-                ignore_index=-1,
-            ).view_as(x)
+        logits, _ = model(x, attn_mask=attn_mask)
+        token_losses = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            targets.view(-1),
+            reduction="none",
+            ignore_index=-1,
+        ).view_as(x)
 
-            for sample_idx in range(x.size(0)):
-                for position_idx in range(x.size(1)):
-                    if not valid_mask[sample_idx, position_idx]:
-                        continue
+        for sample_idx in range(x.size(0)):
+            for position_idx in range(x.size(1)):
+                if not valid_mask[sample_idx, position_idx]:
+                    continue
 
-                    start = max(0, position_idx - context_window)
-                    context_ids = x[sample_idx, start : position_idx + 1].tolist()
-                    input_id = int(x[sample_idx, position_idx])
-                    target_id = int(targets[sample_idx, position_idx])
-                    rows.append(
-                        {
-                            "loss": float(token_losses[sample_idx, position_idx]),
-                            "micro_batch": micro_batch_idx,
-                            "sample": sample_idx,
-                            "position": position_idx,
-                            "input_token_id": input_id,
-                            "target_token_id": target_id,
-                            "input_token": token_text(tokenizer, input_id),
-                            "target_token": token_text(tokenizer, target_id),
-                            "context": escape_text(tokenizer.decode(context_ids)),
-                        }
-                    )
+                start = max(0, position_idx - context_window)
+                context_ids = x[sample_idx, start : position_idx + 1].tolist()
+                input_id = int(x[sample_idx, position_idx])
+                target_id = int(targets[sample_idx, position_idx])
+                rows.append(
+                    {
+                        "loss": float(token_losses[sample_idx, position_idx]),
+                        "micro_batch": micro_batch_idx,
+                        "sample": sample_idx,
+                        "position": position_idx,
+                        "input_token_id": input_id,
+                        "target_token_id": target_id,
+                        "input_token": token_text(tokenizer, input_id),
+                        "target_token": token_text(tokenizer, target_id),
+                        "context": escape_text(tokenizer.decode(context_ids)),
+                    }
+                )
 
     rows.sort(key=lambda row: row["loss"], reverse=True)
 
@@ -177,12 +168,13 @@ def analyze_checkpoint(
     print(f"step: {checkpoint.get('step')}")
     print(f"saved loss: {checkpoint.get('loss')}")
     print(f"saved grad norm: {checkpoint.get('grad_norm')}")
-    print(f"micro-batches: {len(batch_xs)}")
+    print(f"micro-batches: {len(batch_contents)}")
     print(f"scored tokens: {len(rows)}")
-    print(
-        "note: the final flattened token of each saved micro-batch is skipped because "
-        "the outlier checkpoint stores x but not the final next-token target."
-    )
+    if checkpoint.get("outlier_batch_contents") is None:
+        print(
+            "note: this checkpoint uses the older x-only format, so the final "
+            "flattened token of each saved micro-batch is skipped."
+        )
     print()
     print("top token losses:")
     for rank, row in enumerate(rows[:top_k], start=1):
