@@ -11,7 +11,7 @@ from model import Model, ModelConfig, PositionEmbeddingType
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a saved outlier batch through the model on CPU and sort tokens by loss."
+        description="Run a saved outlier batch through the model and sort tokens by loss."
     )
     parser.add_argument(
         "checkpoint",
@@ -69,9 +69,9 @@ def resolve_checkpoint_path(path_arg: str | None) -> Path:
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
     try:
-        return torch.load(path, map_location="cpu", weights_only=False)
+        return torch.load(path, map_location="cuda", weights_only=False)
     except TypeError:
-        return torch.load(path, map_location="cpu")
+        return torch.load(path, map_location="cuda")
 
 
 def coerce_position_embedding_type(value: Any) -> PositionEmbeddingType:
@@ -100,7 +100,7 @@ def build_model(checkpoint: dict[str, Any]) -> Model:
     model = Model(config)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    model.to("cpu")
+    model.to("cuda")
     return model
 
 
@@ -123,9 +123,9 @@ def analyze_checkpoint(
     batch_contents = checkpoint.get("outlier_batch_contents")
 
     rows: list[dict[str, Any]] = []
-    for micro_batch_idx, (x_cpu, y_cpu) in enumerate(batch_contents):
-        x = x_cpu.to(dtype=torch.long, device="cpu")
-        targets = y_cpu.to(dtype=torch.long, device="cpu")
+    for micro_batch_idx, (x, y) in enumerate(batch_contents):
+        x = x.to(dtype=torch.long, device="cuda")
+        targets = y.to(dtype=torch.long, device="cuda")
         valid_mask = targets.ne(-1)
         attn_mask = None
         if saved_args.get("intra_doc_mask", False):
