@@ -167,8 +167,7 @@ def _log_outlier_batches(
     step_display: int,
     lossf: float,
     grad_norm: float,
-    tokenizer,
-    batch_xs: list,
+    batch_contents: list,
     model,
     is_distributed: bool,
     optimizer,
@@ -187,24 +186,13 @@ def _log_outlier_batches(
             "step": step_display,
             "loss": lossf,
             "grad_norm": grad_norm,
-            "outlier_batch_xs": batch_xs,
+            "outlier_batch_contents": batch_contents,
             "model_state_dict": checkpoint_model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "args": vars(args),
         },
         checkpoint_path,
     )
-
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"\n{'=' * 72}\n")
-        f.write(f"step {step_display} | loss {lossf:.6f} | grad_norm {grad_norm:.6f}\n")
-        f.write(f"checkpoint {checkpoint_path}\n")
-        for mi, x_cpu in enumerate(batch_xs):
-            f.write(f"\n--- micro_batch {mi} ---\n")
-            for b in range(x_cpu.shape[0]):
-                ids = x_cpu[b].tolist()
-                text = tokenizer.decode(ids)
-                f.write(f"[sample {b}]\n{text}\n")
 
 
 def train(args):
@@ -336,12 +324,14 @@ def train(args):
                 # micro-batch loop where we do gradient accumulation to reach desired total batch size
                 lossf = 0.0  # for getting the mean loss (as simple float) over the accumulation steps
                 total_toks = 0
-                batch_xs_for_log: list = []
+                batch_contents: list = []
 
                 for micro_step in range(args.grad_accum_steps):
                     # fetch a batch
                     x, y = next(train_loader)
-                    batch_xs_for_log.append(x.detach().cpu().clone())
+                    batch_contents.append(
+                        (x.detach().cpu().clone(), y.detach().cpu().clone())
+                    )
 
                     x, y = x.to(device), y.to(device)
                     attn_mask = None
@@ -376,8 +366,7 @@ def train(args):
                             step_display=step + 1,
                             lossf=lossf,
                             grad_norm=norm_f,
-                            tokenizer=tokenizer,
-                            batch_xs=batch_xs_for_log,
+                            batch_contents=batch_contents,
                             model=model,
                             is_distributed=is_distributed,
                             optimizer=optimizer,
