@@ -69,9 +69,9 @@ def resolve_checkpoint_path(path_arg: str | None) -> Path:
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
     try:
-        return torch.load(path, map_location="cuda", weights_only=False)
+        return torch.load(path, map_location="cpu", weights_only=False)
     except TypeError:
-        return torch.load(path, map_location="cuda")
+        return torch.load(path, map_location="cpu")
 
 
 def coerce_position_embedding_type(value: Any) -> PositionEmbeddingType:
@@ -128,31 +128,33 @@ def analyze_checkpoint(
         for micro_batch_idx, (x, y) in enumerate(batch_contents):
             x = x.to(dtype=torch.long, device="cuda")
             targets = y.to(dtype=torch.long, device="cuda")
-            valid_mask = targets.ne(-1)
-            attn_mask = None
-            if saved_args.get("intra_doc_mask", False):
-                attn_mask = make_intra_document_attn_mask(x, eot_token_id)
-
-            logits, _ = model(x, attn_mask=attn_mask)
-            token_losses = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                reduction="none",
-                ignore_index=-1,
-            ).view_as(x)
-
             for sample_idx in range(x.size(0)):
-                for position_idx in range(x.size(1)):
-                    if not valid_mask[sample_idx, position_idx]:
+                sample_x = x[sample_idx : sample_idx + 1]
+                sample_targets = targets[sample_idx : sample_idx + 1]
+                valid_mask = sample_targets.ne(-1)
+                attn_mask = None
+                if saved_args.get("intra_doc_mask", False):
+                    attn_mask = make_intra_document_attn_mask(sample_x, eot_token_id)
+
+                logits, _ = model(sample_x, attn_mask=attn_mask)
+                token_losses = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    sample_targets.view(-1),
+                    reduction="none",
+                    ignore_index=-1,
+                ).view_as(sample_x)
+
+                for position_idx in range(sample_x.size(1)):
+                    if not valid_mask[0, position_idx]:
                         continue
 
                     start = max(0, position_idx - context_window)
-                    context_ids = x[sample_idx, start : position_idx + 1].tolist()
-                    input_id = int(x[sample_idx, position_idx])
-                    target_id = int(targets[sample_idx, position_idx])
+                    context_ids = sample_x[0, start : position_idx + 1].tolist()
+                    input_id = int(sample_x[0, position_idx])
+                    target_id = int(sample_targets[0, position_idx])
                     rows.append(
                         {
-                            "loss": float(token_losses[sample_idx, position_idx]),
+                            "loss": float(token_losses[0, position_idx]),
                             "micro_batch": micro_batch_idx,
                             "sample": sample_idx,
                             "position": position_idx,
