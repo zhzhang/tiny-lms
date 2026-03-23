@@ -280,17 +280,15 @@ def train(args):
             model = DDP(model)
 
     # load dataset and stream-tokenize into packed batches
-    train_dataset = get_dataset()
-    if world_size > 1:
-        train_dataset = train_dataset.shard(num_shards=world_size, index=rank)
+    train_dataset_streams = get_dataset(num_shards=world_size, shard_index=rank)
     train_loader = DataLoader(
-        args.batch_size, args.seq_len, train_dataset, args.data_buffer_size
+        args.batch_size, args.seq_len, train_dataset_streams, args.data_buffer_size
     )
     val_loader = None
     if args.val_every > 0:
-        val_dataset = get_dataset().skip(10_000_000)
+        val_dataset_streams = get_dataset(skip_examples=10_000_000)
         val_loader = DataLoader(
-            args.batch_size, args.seq_len, val_dataset, args.data_buffer_size
+            args.batch_size, args.seq_len, val_dataset_streams, args.data_buffer_size
         )
 
     # init the optimizer

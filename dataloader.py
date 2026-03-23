@@ -1,38 +1,108 @@
 import queue
 import threading
+import zlib
 from collections import Counter
+from dataclasses import dataclass
 
 import tiktoken
 import torch
-from datasets import load_dataset, interleave_datasets
+from datasets import load_dataset
+
+DATASET_SHUFFLE_SEED = 42
+DATASET_SHUFFLE_BUFFER_SIZE = 10_000
+MAX_ZLIB_COMPRESSION_RATIO = 3.0
+
+
+@dataclass(frozen=True)
+class DatasetSpec:
+    namespace: str
+    dataset_name: str | None
+    split: str
+    examples_per_batch: int
+
+    @property
+    def source(self) -> str:
+        if self.dataset_name is None:
+            return self.namespace
+        return f"{self.namespace}-{self.dataset_name}"
+
+
+@dataclass(frozen=True)
+class DatasetStream:
+    source: str
+    dataset: object
+    examples_per_batch: int
+
 
 DATASETS = [
-    ("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", 0.4),
-    ("mlfoundations/dclm-baseline-1.0", None, "train", 0.4),
-    ("HuggingFaceTB/finemath", "finemath-3plus", "train", 0.1),
-    ("HuggingFaceTB/finemath", "infiwebmath-3plus", "train", 0.1),
+    DatasetSpec("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", 4),
+    DatasetSpec("mlfoundations/dclm-baseline-1.0", None, "train", 4),
+    DatasetSpec("HuggingFaceTB/finemath", "finemath-3plus", "train", 1),
+    DatasetSpec("HuggingFaceTB/finemath", "infiwebmath-3plus", "train", 1),
 ]
 
 
-def get_dataset():
-    hf_datasets = [
-        load_dataset(namespace, split=split, streaming=True)
-        if dataset_name is None
-        else load_dataset(namespace, name=dataset_name, split=split, streaming=True)
-        for namespace, dataset_name, split, _ in DATASETS
+def _extract_text(sample):
+    if isinstance(sample, str):
+        return sample
+    if isinstance(sample, dict) and isinstance(sample.get("text"), str):
+        return sample["text"]
+    raise TypeError(
+        "dataset samples must be strings or dicts with a string 'text' field"
+    )
+
+
+def _compression_ratio(text):
+    text_bytes = text.encode("utf-8")
+    if not text_bytes:
+        return 0.0
+    compressed = zlib.compress(text_bytes)
+    return len(text_bytes) / max(len(compressed), 1)
+
+
+def _passes_zlib_filter(sample):
+    return _compression_ratio(_extract_text(sample)) <= MAX_ZLIB_COMPRESSION_RATIO
+
+
+def _load_stream(spec, *, num_shards=1, shard_index=0, skip_examples=0):
+    dataset = (
+        load_dataset(spec.namespace, split=spec.split, streaming=True)
+        if spec.dataset_name is None
+        else load_dataset(
+            spec.namespace, name=spec.dataset_name, split=spec.split, streaming=True
+        )
+    )
+    cols_to_remove = [c for c in dataset.column_names if c != "text"]
+    if cols_to_remove:
+        dataset = dataset.remove_columns(cols_to_remove)
+    dataset = dataset.filter(_passes_zlib_filter)
+    dataset = dataset.shuffle(
+        seed=DATASET_SHUFFLE_SEED, buffer_size=DATASET_SHUFFLE_BUFFER_SIZE
+    )
+    if num_shards > 1:
+        dataset = dataset.shard(num_shards=num_shards, index=shard_index)
+    if skip_examples > 0:
+        dataset = dataset.skip(skip_examples)
+    return DatasetStream(
+        source=spec.source,
+        dataset=dataset,
+        examples_per_batch=spec.examples_per_batch,
+    )
+
+
+def get_dataset(*, num_shards=1, shard_index=0, skip_examples=0):
+    print("Loading and shuffling datasets independently...")
+    streams = [
+        _load_stream(
+            spec,
+            num_shards=num_shards,
+            shard_index=shard_index,
+            skip_examples=skip_examples,
+        )
+        for spec in DATASETS
     ]
-    for i, ds in enumerate(hf_datasets):
-        source = f"{DATASETS[i][0]}-{DATASETS[i][1]}"
-        cols_to_remove = [c for c in ds.column_names if c != "text"]
-        if cols_to_remove:
-            ds = ds.remove_columns(cols_to_remove)
-        hf_datasets[i] = ds.map(lambda x, source=source: {**x, "source": source})
-    print("Interleaving datasets...")
-    out = interleave_datasets(hf_datasets, probabilities=[p for _, _, _, p in DATASETS])
-    print("Shuffling dataset...")
-    out = out.shuffle(seed=42)
     print("Done")
-    return out
+    return streams
 
 
 def _format_source_proportions(source_proportions):
@@ -45,94 +115,121 @@ def _format_source_proportions(source_proportions):
 
 
 class DataLoader:
-    def __init__(self, batch_size, seq_len, dataset, buffer_size):
+    def __init__(self, batch_size, seq_len, dataset_streams, buffer_size):
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
         if seq_len <= 0:
             raise ValueError("seq_len must be > 0")
         if buffer_size <= 0:
             raise ValueError("buffer_size must be > 0")
+        if not dataset_streams:
+            raise ValueError("dataset_streams must not be empty")
 
         self.batch_size = batch_size
         self.seq_len = seq_len
-        self.dataset = dataset
+        self.dataset_streams = list(dataset_streams)
         self.buffer_size = buffer_size
-        self._tokens_per_batch = self.batch_size * self.seq_len + 1
+        self._batch_examples = sum(
+            stream.examples_per_batch for stream in self.dataset_streams
+        )
+        if self._batch_examples != self.batch_size:
+            raise ValueError(
+                f"sum(DATASETS examples_per_batch) must equal batch_size ({self.batch_size}), "
+                f"got {self._batch_examples}"
+            )
 
         self._enc = tiktoken.get_encoding("gpt2")
         self.eot_token = self._enc.eot_token
 
-        self._dataset_iter = iter(self.dataset)
-        self._token_buffer = []
-        self._source_buffer = []
-        self._sample_queue = queue.Queue(maxsize=8)
+        self._dataset_iters = [iter(stream.dataset) for stream in self.dataset_streams]
+        self._token_buffers = [[] for _ in self.dataset_streams]
+        self._sample_queues = [queue.Queue(maxsize=8) for _ in self.dataset_streams]
         self._batch_queue = queue.Queue(maxsize=self.buffer_size)
         self._stop_event = threading.Event()
-        self._fetcher_thread = threading.Thread(
-            target=self._fetcher_loop, daemon=True, name="dataloader-fetcher"
-        )
+        self._fetcher_threads = [
+            threading.Thread(
+                target=self._fetcher_loop,
+                args=(dataset_idx,),
+                daemon=True,
+                name=f"dataloader-fetcher-{dataset_idx}",
+            )
+            for dataset_idx in range(len(self.dataset_streams))
+        ]
         self._producer_thread = threading.Thread(
             target=self._producer_loop, daemon=True, name="dataloader-producer"
         )
-        self._fetcher_thread.start()
+        for fetcher_thread in self._fetcher_threads:
+            fetcher_thread.start()
         self._producer_thread.start()
 
-    def _extract_text_and_source(self, sample):
-        if isinstance(sample, str):
-            return sample, "unknown"
-        if isinstance(sample, dict):
-            if "text" in sample and isinstance(sample["text"], str):
-                return sample["text"], sample.get("source", "unknown")
-            raise ValueError("dataset dict samples must include a string 'text' field")
-        raise TypeError("dataset samples must be strings or dicts with a 'text' field")
-
-    def _next_sample(self):
+    def _next_sample(self, dataset_idx):
         while True:
             try:
-                return next(self._dataset_iter)
+                return next(self._dataset_iters[dataset_idx])
             except StopIteration:
                 # Restart for finite datasets so iteration can continue.
-                self._dataset_iter = iter(self.dataset)
+                self._dataset_iters[dataset_idx] = iter(
+                    self.dataset_streams[dataset_idx].dataset
+                )
 
     # Sentinel for sample queue when fetcher stops
     _SAMPLE_END = object()
 
-    def _fetcher_loop(self):
+    def _put_with_stop(self, q, item):
+        while not self._stop_event.is_set():
+            try:
+                q.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _fetcher_loop(self, dataset_idx):
         try:
             while not self._stop_event.is_set():
-                sample = self._next_sample()
-                self._sample_queue.put(sample)
+                sample = self._next_sample(dataset_idx)
+                self._put_with_stop(self._sample_queues[dataset_idx], sample)
         finally:
-            self._sample_queue.put(self._SAMPLE_END)
+            self._put_with_stop(self._sample_queues[dataset_idx], self._SAMPLE_END)
 
-    def _fill_token_buffer(self, min_tokens):
-        while len(self._token_buffer) < min_tokens and not self._stop_event.is_set():
+    def _fill_token_buffer(self, dataset_idx, min_tokens):
+        token_buffer = self._token_buffers[dataset_idx]
+        sample_queue = self._sample_queues[dataset_idx]
+        while len(token_buffer) < min_tokens and not self._stop_event.is_set():
             try:
-                sample = self._sample_queue.get(timeout=0.1)
+                sample = sample_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
             if sample is self._SAMPLE_END:
                 return
-            text, source = self._extract_text_and_source(sample)
+            text = _extract_text(sample)
             doc_tokens = self._enc.encode_ordinary(text)
             doc_tokens.append(self.eot_token)
-            self._token_buffer.extend(doc_tokens)
-            self._source_buffer.extend([source] * len(doc_tokens))
+            token_buffer.extend(doc_tokens)
 
     def _build_batch(self):
-        self._fill_token_buffer(self._tokens_per_batch)
-        if len(self._token_buffer) < self._tokens_per_batch:
-            raise StopIteration
+        x_parts = []
+        y_parts = []
+        source_counts = Counter()
 
-        flat = self._token_buffer[: self._tokens_per_batch]
-        flat_sources = self._source_buffer[: self._tokens_per_batch]
-        self._token_buffer = self._token_buffer[self._tokens_per_batch :]
-        self._source_buffer = self._source_buffer[self._tokens_per_batch :]
+        for dataset_idx, stream in enumerate(self.dataset_streams):
+            dataset_tokens_per_batch = stream.examples_per_batch * self.seq_len + 1
+            self._fill_token_buffer(dataset_idx, dataset_tokens_per_batch)
+            token_buffer = self._token_buffers[dataset_idx]
+            if len(token_buffer) < dataset_tokens_per_batch:
+                raise StopIteration
 
-        flat = torch.tensor(flat, dtype=torch.long)
-        x = flat[:-1].view(self.batch_size, self.seq_len)
-        y = flat[1:].view(self.batch_size, self.seq_len)
-        source_counts = Counter(flat_sources[:-1])
+            flat = token_buffer[:dataset_tokens_per_batch]
+            self._token_buffers[dataset_idx] = token_buffer[dataset_tokens_per_batch:]
+            flat = torch.tensor(flat, dtype=torch.long)
+            x_part = flat[:-1].view(stream.examples_per_batch, self.seq_len)
+            y_part = flat[1:].view(stream.examples_per_batch, self.seq_len)
+            x_parts.append(x_part)
+            y_parts.append(y_part)
+            source_counts[stream.source] += x_part.numel()
+
+        x = torch.cat(x_parts, dim=0)
+        y = torch.cat(y_parts, dim=0)
         total_tokens = max(sum(source_counts.values()), 1)
         source_proportions = {
             source: count / total_tokens
@@ -145,7 +242,8 @@ class DataLoader:
             while not self._stop_event.is_set():
                 batch = self._build_batch()
                 # Block only when queue is full (backpressure); otherwise emit immediately
-                self._batch_queue.put(batch)
+                if not self._put_with_stop(self._batch_queue, batch):
+                    return
         except StopIteration:
             pass
 
@@ -167,32 +265,44 @@ class DataLoader:
 
     def close(self):
         self._stop_event.set()
-        if self._fetcher_thread.is_alive():
-            self._fetcher_thread.join(timeout=1.0)
+        for fetcher_thread in self._fetcher_threads:
+            if fetcher_thread.is_alive():
+                fetcher_thread.join(timeout=1.0)
         if self._producer_thread.is_alive():
             self._producer_thread.join(timeout=1.0)
 
     def reset(self):
         self.close()
         self._stop_event = threading.Event()
-        self._dataset_iter = iter(self.dataset)
-        self._token_buffer = []
-        self._source_buffer = []
-        self._sample_queue = queue.Queue(maxsize=8)
+        self._dataset_iters = [iter(stream.dataset) for stream in self.dataset_streams]
+        self._token_buffers = [[] for _ in self.dataset_streams]
+        self._sample_queues = [queue.Queue(maxsize=8) for _ in self.dataset_streams]
         self._batch_queue = queue.Queue(maxsize=self.buffer_size)
-        self._fetcher_thread = threading.Thread(
-            target=self._fetcher_loop, daemon=True, name="dataloader-fetcher"
-        )
+        self._fetcher_threads = [
+            threading.Thread(
+                target=self._fetcher_loop,
+                args=(dataset_idx,),
+                daemon=True,
+                name=f"dataloader-fetcher-{dataset_idx}",
+            )
+            for dataset_idx in range(len(self.dataset_streams))
+        ]
         self._producer_thread = threading.Thread(
             target=self._producer_loop, daemon=True, name="dataloader-producer"
         )
-        self._fetcher_thread.start()
+        for fetcher_thread in self._fetcher_threads:
+            fetcher_thread.start()
         self._producer_thread.start()
 
 
 if __name__ == "__main__":
-    dataset = get_dataset()
-    loader = DataLoader(batch_size=4, seq_len=128, dataset=dataset, buffer_size=2)
+    dataset_streams = get_dataset()
+    loader = DataLoader(
+        batch_size=sum(spec.examples_per_batch for spec in DATASETS),
+        seq_len=128,
+        dataset_streams=dataset_streams,
+        buffer_size=2,
+    )
     print("Initialized loader")
     try:
         for i in range(5):
