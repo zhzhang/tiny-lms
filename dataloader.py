@@ -2,7 +2,6 @@ import queue
 import random
 import threading
 import zlib
-from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -185,17 +184,6 @@ def get_dataset(*, num_shards=1, shard_index=0, skip_examples=0):
     train_streams = [train_stream for train_stream, _ in stream_pairs]
     validation_streams = [validation_stream for _, validation_stream in stream_pairs]
     return train_streams, validation_streams
-
-
-def _format_source_proportions(source_proportions):
-    if not source_proportions:
-        return "unknown=1.000"
-    return " | ".join(
-        f"{source}={proportion:.3f}"
-        for source, proportion in sorted(source_proportions.items())
-    )
-
-
 class DataLoader:
     def __init__(self, batch_size, seq_len, dataset_streams, buffer_size):
         if batch_size <= 0:
@@ -292,7 +280,6 @@ class DataLoader:
     def _build_batch(self):
         x_parts = []
         y_parts = []
-        source_counts = Counter()
 
         for dataset_idx, stream in enumerate(self.dataset_streams):
             dataset_tokens_per_batch = stream.examples_per_batch * self.seq_len + 1
@@ -308,16 +295,10 @@ class DataLoader:
             y_part = flat[1:].view(stream.examples_per_batch, self.seq_len)
             x_parts.append(x_part)
             y_parts.append(y_part)
-            source_counts[stream.source] += x_part.numel()
 
         x = torch.cat(x_parts, dim=0)
         y = torch.cat(y_parts, dim=0)
-        total_tokens = max(sum(source_counts.values()), 1)
-        source_proportions = {
-            source: count / total_tokens
-            for source, count in sorted(source_counts.items())
-        }
-        return x, y, source_proportions
+        return x, y
 
     def _producer_loop(self):
         try:
@@ -337,8 +318,7 @@ class DataLoader:
             if self._stop_event.is_set() and self._batch_queue.empty():
                 raise StopIteration
             try:
-                x, y, source_proportions = self._batch_queue.get(timeout=0.1)
-                print(f"batch sources {_format_source_proportions(source_proportions)}")
+                x, y = self._batch_queue.get(timeout=0.1)
                 return x, y
             except queue.Empty:
                 if not self._producer_thread.is_alive():
