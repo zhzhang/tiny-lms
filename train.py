@@ -8,11 +8,11 @@ from contextlib import nullcontext
 import tiktoken
 import torch
 from dataloader import DataLoader, get_dataset
-import lm_eval
 from model import Model, ModelConfig, PositionEmbeddingType
 from torch import distributed as dist
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
+from eval import evaluate_model, LMEvalHarness
 
 torch.autograd.set_detect_anomaly(True)
 
@@ -443,10 +443,17 @@ def train(args):
                             wandb_run.log({"val/loss": val_loss_mean}, step=step + 1)
 
                 if args.eval_every > 0 and ((step + 1) % args.eval_every == 0):
-                    lm_eval.simple_evaluate(
+                    eval_model = LMEvalHarness(
                         model=model,
-                        tasks=["mmlu"],
+                        tokenizer=tokenizer,
+                        device=device,
+                        max_length=args.seq_len,
+                        max_gen_toks=args.seq_len,
                     )
+                    eval_results = evaluate_model(eval_model)
+                    print(eval_results)
+                    if wandb_run is not None:
+                        wandb_run.log(eval_results, step=step + 1)
 
                 _save_checkpoint_if_needed(
                     step=step,
