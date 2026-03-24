@@ -27,7 +27,7 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=10)
     parser.add_argument("--seq-len", type=int, default=1024)
-    parser.add_argument("--data-buffer-size", type=int, default=8)
+    parser.add_argument("--data-buffer-size", type=int, default=128)
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--learning-rate-decay-frac", type=float, default=0.0)
     parser.add_argument("--weight-decay", type=float, default=0.1)

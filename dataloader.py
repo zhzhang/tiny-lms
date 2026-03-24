@@ -153,8 +153,6 @@ def _load_stream(spec, *, num_shards=1, shard_index=0, skip_examples=0):
         VALIDATION_SIZE_FRACTION,
         VALIDATION_SPLIT_SEED,
     )
-    print(f"train files: {train_files}")
-    print(f"validation files: {validation_files}")
     train_stream = _build_stream(
         spec,
         {"train": train_files},
