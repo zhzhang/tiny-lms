@@ -475,6 +475,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "huggingface-hub" },
     { name = "ipykernel" },
     { name = "lm-eval" },
     { name = "nbformat" },
@@ -490,6 +491,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=4.5.0" },
+    { name = "huggingface-hub", specifier = ">=1.4.1" },
     { name = "ipykernel", specifier = ">=7.2.0" },
     { name = "lm-eval", specifier = ">=0.4.11" },
     { name = "nbformat", specifier = ">=5.10.4" },

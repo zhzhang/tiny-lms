@@ -1,30 +1,33 @@
 import queue
+import random
 import threading
 import zlib
 from collections import Counter
 from dataclasses import dataclass
+from functools import lru_cache
 
 import tiktoken
 import torch
-from datasets import load_dataset
+from datasets import load_dataset as hf_load_dataset
+from huggingface_hub import HfFileSystem
 
 DATASET_SHUFFLE_SEED = 42
 DATASET_SHUFFLE_BUFFER_SIZE = 10_000
 MAX_ZLIB_COMPRESSION_RATIO = 3.0
+VALIDATION_SIZE_FRACTION = 0.01
+VALIDATION_SPLIT_SEED = 42
+HF_FS = HfFileSystem()
 
 
 @dataclass(frozen=True)
 class DatasetSpec:
     namespace: str
-    dataset_name: str | None
-    split: str
+    glob_pattern: str
     examples_per_batch: int
 
     @property
     def source(self) -> str:
-        if self.dataset_name is None:
-            return self.namespace
-        return f"{self.namespace}-{self.dataset_name}"
+        return f"{self.namespace}:{self.glob_pattern}"
 
 
 @dataclass(frozen=True)
@@ -35,10 +38,10 @@ class DatasetStream:
 
 
 DATASETS = [
-    DatasetSpec("HuggingFaceFW/fineweb-edu", "sample-10BT", "train", 4),
-    DatasetSpec("mlfoundations/dclm-baseline-1.0", None, "train", 4),
-    DatasetSpec("HuggingFaceTB/finemath", "finemath-3plus", "train", 1),
-    DatasetSpec("HuggingFaceTB/finemath", "infiwebmath-3plus", "train", 1),
+    DatasetSpec("HuggingFaceFW/fineweb-edu", "sample/10BT/**/*.parquet", 4),
+    DatasetSpec("mlfoundations/dclm-baseline-1.0", "**/*.zst", 4),
+    DatasetSpec("HuggingFaceTB/finemath", "finemath-3plus/**/*.parquet", 1),
+    DatasetSpec("HuggingFaceTB/finemath", "infiwebmath-3plus/**/*.parquet", 1),
 ]
 
 
@@ -64,13 +67,66 @@ def _passes_zlib_filter(sample):
     return _compression_ratio(_extract_text(sample)) <= MAX_ZLIB_COMPRESSION_RATIO
 
 
-def _load_stream(spec, *, num_shards=1, shard_index=0, skip_examples=0):
-    dataset = (
-        load_dataset(spec.namespace, split=spec.split, streaming=True)
-        if spec.dataset_name is None
-        else load_dataset(
-            spec.namespace, name=spec.dataset_name, split=spec.split, streaming=True
+@lru_cache(maxsize=None)
+def _glob_file_info(namespace, glob_pattern):
+    repo_prefix = f"datasets/{namespace}/"
+    matches = sorted(HF_FS.glob(f"{repo_prefix}{glob_pattern}"))
+    files = []
+    for match in matches:
+        info = HF_FS.info(match)
+        if info.get("type") != "file":
+            continue
+        files.append((match.removeprefix(repo_prefix), int(info["size"])))
+    if not files:
+        raise ValueError(f"No files matched {namespace}:{glob_pattern}")
+    return tuple(files)
+
+
+@lru_cache(maxsize=None)
+def _split_data_files(namespace, glob_pattern, validation_fraction, seed):
+    if not 0.0 <= validation_fraction < 1.0:
+        raise ValueError("validation_fraction must be in [0.0, 1.0)")
+
+    files = list(_glob_file_info(namespace, glob_pattern))
+    all_paths = [path for path, _ in files]
+    if len(files) == 1 or validation_fraction == 0.0:
+        return tuple(all_paths), tuple()
+
+    total_size = sum(size for _, size in files)
+    target_validation_size = total_size * validation_fraction
+    rng = random.Random(f"{seed}:{namespace}:{glob_pattern}")
+    shuffled_files = files.copy()
+    rng.shuffle(shuffled_files)
+
+    validation_files = []
+    validation_size = 0
+    for file_idx, (path, size) in enumerate(shuffled_files):
+        remaining_files = len(shuffled_files) - file_idx - 1
+        if validation_size >= target_validation_size or remaining_files == 0:
+            break
+        validation_files.append(path)
+        validation_size += size
+
+    validation_set = set(validation_files)
+    train_files = [path for path in all_paths if path not in validation_set]
+    val_files = [path for path in all_paths if path in validation_set]
+    if not train_files:
+        raise ValueError(
+            f"Validation split consumed every file for {namespace}:{glob_pattern}"
         )
+    return tuple(train_files), tuple(val_files)
+
+
+def _build_stream(spec, data_files, *, num_shards=1, shard_index=0, skip_examples=0):
+    if not data_files:
+        raise ValueError(f"No files selected for {spec.source}")
+    split = next(iter(data_files))
+
+    dataset = hf_load_dataset(
+        spec.namespace,
+        split=split,
+        streaming=True,
+        data_files={split: list(data_files[split])},
     )
     cols_to_remove = [c for c in dataset.column_names if c != "text"]
     if cols_to_remove:
@@ -90,9 +146,35 @@ def _load_stream(spec, *, num_shards=1, shard_index=0, skip_examples=0):
     )
 
 
+def _load_stream(spec, *, num_shards=1, shard_index=0, skip_examples=0):
+    train_files, validation_files = _split_data_files(
+        spec.namespace,
+        spec.glob_pattern,
+        VALIDATION_SIZE_FRACTION,
+        VALIDATION_SPLIT_SEED,
+    )
+    print(f"train files: {train_files}")
+    print(f"validation files: {validation_files}")
+    train_stream = _build_stream(
+        spec,
+        {"train": train_files},
+        num_shards=num_shards,
+        shard_index=shard_index,
+        skip_examples=skip_examples,
+    )
+    validation_stream = _build_stream(
+        spec,
+        {"validation": validation_files},
+        num_shards=num_shards,
+        shard_index=shard_index,
+        skip_examples=skip_examples,
+    )
+    return train_stream, validation_stream
+
+
 def get_dataset(*, num_shards=1, shard_index=0, skip_examples=0):
     print("Loading and shuffling datasets independently...")
-    streams = [
+    stream_pairs = [
         _load_stream(
             spec,
             num_shards=num_shards,
@@ -102,7 +184,9 @@ def get_dataset(*, num_shards=1, shard_index=0, skip_examples=0):
         for spec in DATASETS
     ]
     print("Done")
-    return streams
+    train_streams = [train_stream for train_stream, _ in stream_pairs]
+    validation_streams = [validation_stream for _, validation_stream in stream_pairs]
+    return train_streams, validation_streams
 
 
 def _format_source_proportions(source_proportions):
@@ -296,7 +380,7 @@ class DataLoader:
 
 
 if __name__ == "__main__":
-    dataset_streams = get_dataset()
+    dataset_streams, _ = get_dataset()
     loader = DataLoader(
         batch_size=sum(spec.examples_per_batch for spec in DATASETS),
         seq_len=128,
