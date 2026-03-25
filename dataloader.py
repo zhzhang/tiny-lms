@@ -22,7 +22,7 @@ HF_FS = HfFileSystem()
 class DatasetSpec:
     namespace: str
     glob_pattern: str
-    examples_per_batch: int
+    ratio: int
 
     @property
     def source(self) -> str:
@@ -33,12 +33,12 @@ class DatasetSpec:
 class DatasetStream:
     source: str
     dataset: object
-    examples_per_batch: int
+    ratio: int
 
 
 DATASETS = [
-    DatasetSpec("HuggingFaceFW/fineweb-edu", "sample/10BT/**/*.parquet", 4),
-    DatasetSpec("mlfoundations/dclm-baseline-1.0", "**/*.zst", 4),
+    DatasetSpec("HuggingFaceFW/fineweb-edu", "sample/10BT/**/*.parquet", 7),
+    DatasetSpec("mlfoundations/dclm-baseline-1.0", "**/*.zst", 7),
     DatasetSpec("HuggingFaceTB/finemath", "finemath-3plus/**/*.parquet", 1),
     DatasetSpec("HuggingFaceTB/finemath", "infiwebmath-3plus/**/*.parquet", 1),
 ]
@@ -141,7 +141,7 @@ def _build_stream(spec, data_files, *, num_shards=1, shard_index=0, skip_example
     return DatasetStream(
         source=spec.source,
         dataset=dataset,
-        examples_per_batch=spec.examples_per_batch,
+        ratio=spec.ratio,
     )
 
 
@@ -199,14 +199,14 @@ class DataLoader:
         self.seq_len = seq_len
         self.dataset_streams = list(dataset_streams)
         self.buffer_size = buffer_size
-        self._batch_examples = sum(
-            stream.examples_per_batch for stream in self.dataset_streams
-        )
-        if self._batch_examples != self.batch_size:
+        total_ratio = sum(stream.ratio for stream in self.dataset_streams)
+        if self.batch_size % total_ratio != 0:
             raise ValueError(
-                f"sum(DATASETS examples_per_batch) must equal batch_size ({self.batch_size}), "
-                f"got {self._batch_examples}"
+                f"batch_size ({self.batch_size}) must be divisible by the sum of DATASETS "
+                f"ratios ({total_ratio})"
             )
+        scale = self.batch_size // total_ratio
+        self._examples_per_batch = [scale * stream.ratio for stream in self.dataset_streams]
 
         self._enc = tiktoken.get_encoding("gpt2")
         self.eot_token = self._enc.eot_token
@@ -281,8 +281,9 @@ class DataLoader:
         x_parts = []
         y_parts = []
 
-        for dataset_idx, stream in enumerate(self.dataset_streams):
-            dataset_tokens_per_batch = stream.examples_per_batch * self.seq_len + 1
+        for dataset_idx in range(len(self.dataset_streams)):
+            n_examples = self._examples_per_batch[dataset_idx]
+            dataset_tokens_per_batch = n_examples * self.seq_len + 1
             self._fill_token_buffer(dataset_idx, dataset_tokens_per_batch)
             token_buffer = self._token_buffers[dataset_idx]
             if len(token_buffer) < dataset_tokens_per_batch:
@@ -291,8 +292,8 @@ class DataLoader:
             flat = token_buffer[:dataset_tokens_per_batch]
             self._token_buffers[dataset_idx] = token_buffer[dataset_tokens_per_batch:]
             flat = torch.tensor(flat, dtype=torch.long)
-            x_part = flat[:-1].view(stream.examples_per_batch, self.seq_len)
-            y_part = flat[1:].view(stream.examples_per_batch, self.seq_len)
+            x_part = flat[:-1].view(n_examples, self.seq_len)
+            y_part = flat[1:].view(n_examples, self.seq_len)
             x_parts.append(x_part)
             y_parts.append(y_part)
 
@@ -360,7 +361,7 @@ class DataLoader:
 if __name__ == "__main__":
     dataset_streams, _ = get_dataset()
     loader = DataLoader(
-        batch_size=sum(spec.examples_per_batch for spec in DATASETS),
+        batch_size=sum(spec.ratio for spec in DATASETS),
         seq_len=128,
         dataset_streams=dataset_streams,
         buffer_size=2,

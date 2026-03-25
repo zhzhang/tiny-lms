@@ -5,7 +5,7 @@ from dataloader import DATASETS, DataLoader, get_dataset
 
 
 def parse_args():
-    default_batch_size = sum(spec.examples_per_batch for spec in DATASETS)
+    default_batch_size = sum(spec.ratio for spec in DATASETS)
     parser = argparse.ArgumentParser(
         description="Benchmark train dataloader throughput."
     )
