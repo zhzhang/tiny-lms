@@ -1,5 +1,4 @@
 import argparse
-import json
 from pathlib import Path
 from typing import Any
 
@@ -13,13 +12,16 @@ from model import Model, ModelConfig, PositionEmbeddingType
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run a saved outlier batch through the model and sort tokens by loss."
+        description="Run saved outlier batches through the model and sort examples by loss."
     )
     parser.add_argument(
         "checkpoint",
         nargs="?",
         default=None,
-        help="Path to an outlier checkpoint. Defaults to the newest file in outlier_batches/.",
+        help=(
+            "Path to an outlier checkpoint or directory. Defaults to scanning every "
+            "*_outlier.pt under outlier_batches/."
+        ),
     )
     parser.add_argument(
         "--top-k",
@@ -37,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         type=str,
         default=None,
-        help="Optional path to write the full sorted results as TSV.",
+        help="Optional path to write the full sorted results as a pandas pickle.",
     )
     return parser.parse_args()
 
@@ -53,20 +55,23 @@ def make_intra_document_attn_mask(tokens: torch.Tensor, eot_token: int) -> torch
     return (same_doc & causal).unsqueeze(1)
 
 
-def resolve_checkpoint_path(path_arg: str | None) -> Path:
+def resolve_checkpoint_paths(path_arg: str | None) -> list[Path]:
     if path_arg is not None:
         path = Path(path_arg)
         if not path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {path}")
-        return path
-
-    matches = sorted(
-        Path("outlier_batches").rglob("*_outlier.pt"),
-        key=lambda path: path.stat().st_mtime,
-    )
+            raise FileNotFoundError(f"Checkpoint or directory not found: {path}")
+        if path.is_file():
+            return [path]
+        matches = sorted(path.rglob("*_outlier.pt"), key=lambda checkpoint: checkpoint.stat().st_mtime)
+    else:
+        matches = sorted(
+            Path("outlier_batches").rglob("*_outlier.pt"),
+            key=lambda checkpoint: checkpoint.stat().st_mtime,
+        )
     if not matches:
-        raise FileNotFoundError("No outlier checkpoint found under outlier_batches/")
-    return matches[-1]
+        search_root = path_arg if path_arg is not None else "outlier_batches/"
+        raise FileNotFoundError(f"No outlier checkpoint found under {search_root}")
+    return matches
 
 
 def load_checkpoint(path: Path) -> dict[str, Any]:
@@ -126,8 +131,8 @@ def total_grad_norm(parameters: list[torch.nn.Parameter]) -> float:
 
 
 def analyze_checkpoint(
-    checkpoint_path: Path, top_k: int, context_window: int, output_path: str | None
-) -> None:
+    checkpoint_path: Path, context_window: int
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     checkpoint = load_checkpoint(checkpoint_path)
     model = build_model(checkpoint)
     tokenizer = tiktoken.get_encoding("gpt2")
@@ -192,6 +197,11 @@ def analyze_checkpoint(
 
             rows.append(
                 {
+                    "checkpoint_path": str(checkpoint_path),
+                    "checkpoint_name": checkpoint_path.name,
+                    "checkpoint_step": checkpoint.get("step"),
+                    "checkpoint_saved_loss": checkpoint.get("loss"),
+                    "checkpoint_saved_grad_norm": checkpoint.get("grad_norm"),
                     "loss": float(mean_loss.detach()),
                     "grad_norm": grad_norm,
                     "micro_batch": micro_batch_idx,
@@ -206,74 +216,78 @@ def analyze_checkpoint(
                     "contexts": contexts,
                 }
             )
+    summary = {
+        "checkpoint_path": str(checkpoint_path),
+        "step": checkpoint.get("step"),
+        "saved_loss": checkpoint.get("loss"),
+        "saved_grad_norm": checkpoint.get("grad_norm"),
+        "micro_batch_count": len(batch_contents),
+        "scored_examples": len(rows),
+    }
+    return rows, summary
 
-    rows.sort(key=lambda row: row["loss"], reverse=True)
 
-    print(f"checkpoint: {checkpoint_path}")
-    print(f"step: {checkpoint.get('step')}")
-    print(f"saved loss: {checkpoint.get('loss')}")
-    print(f"saved grad norm: {checkpoint.get('grad_norm')}")
-    print(f"micro-batches: {len(batch_contents)}")
+def print_summary(
+    checkpoint_summaries: list[dict[str, Any]], rows: list[dict[str, Any]], top_k: int
+) -> None:
+    print(f"checkpoints analyzed: {len(checkpoint_summaries)}")
     print(f"scored examples: {len(rows)}")
-    if checkpoint.get("outlier_batch_contents") is None:
+    print()
+    print("per-checkpoint summary:")
+    for summary in checkpoint_summaries:
         print(
-            "note: this checkpoint uses the older x-only format, so the final "
-            "flattened token of each saved micro-batch is skipped."
+            f"{summary['checkpoint_path']} | step={summary['step']} | "
+            f"saved_loss={summary['saved_loss']} | "
+            f"saved_grad_norm={summary['saved_grad_norm']} | "
+            f"micro_batches={summary['micro_batch_count']} | "
+            f"scored_examples={summary['scored_examples']}"
         )
     print()
     print("top example losses:")
     for rank, row in enumerate(rows[:top_k], start=1):
         print(
             f"{rank:4d} | loss={row['loss']:.6f} | grad_norm={row['grad_norm']:.6f} | "
-            f"micro={row['micro_batch']} | sample={row['sample']} | "
-            f"tokens={row['token_count']}"
+            f"checkpoint={row['checkpoint_name']} | micro={row['micro_batch']} | "
+            f"sample={row['sample']} | tokens={row['token_count']}"
         )
+
+
+def build_output_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    dataframe = pd.DataFrame(rows)
+    if dataframe.empty:
+        return dataframe
+    dataframe.insert(0, "rank", range(1, len(dataframe) + 1))
+    return dataframe
+
+
+def analyze_checkpoints(
+    checkpoint_paths: list[Path], top_k: int, context_window: int, output_path: str | None
+) -> None:
+    all_rows: list[dict[str, Any]] = []
+    checkpoint_summaries: list[dict[str, Any]] = []
+    for checkpoint_path in checkpoint_paths:
+        checkpoint_rows, checkpoint_summary = analyze_checkpoint(
+            checkpoint_path=checkpoint_path,
+            context_window=context_window,
+        )
+        all_rows.extend(checkpoint_rows)
+        checkpoint_summaries.append(checkpoint_summary)
+
+    all_rows.sort(key=lambda row: row["loss"], reverse=True)
+    print_summary(checkpoint_summaries, all_rows, top_k)
 
     if output_path is not None:
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        output_rows: list[dict[str, Any]] = []
-        for rank, row in enumerate(rows, start=1):
-            output_rows.append(
-                {
-                    "rank": rank,
-                    "loss": row["loss"],
-                    "grad_norm": row["grad_norm"],
-                    "micro_batch": row["micro_batch"],
-                    "sample": row["sample"],
-                    "token_count": row["token_count"],
-                    "token_positions": json.dumps(
-                        row["token_positions"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                    "token_losses": json.dumps(
-                        row["token_losses"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                    "input_token_ids": json.dumps(
-                        row["input_token_ids"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                    "target_token_ids": json.dumps(
-                        row["target_token_ids"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                    "input_tokens": json.dumps(
-                        row["input_tokens"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                    "target_tokens": json.dumps(
-                        row["target_tokens"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                    "contexts": json.dumps(
-                        row["contexts"], ensure_ascii=True, separators=(",", ":")
-                    ),
-                }
-            )
-        pd.DataFrame(output_rows).to_csv(output, sep="\t", index=False)
+        build_output_dataframe(all_rows).to_pickle(output)
         print()
-        print(f"wrote sorted TSV: {output}")
+        print(f"wrote sorted pickle: {output}")
 
 
 if __name__ == "__main__":
     args = parse_args()
-    analyze_checkpoint(
-        checkpoint_path=resolve_checkpoint_path(args.checkpoint),
+    analyze_checkpoints(
+        checkpoint_paths=resolve_checkpoint_paths(args.checkpoint),
         top_k=args.top_k,
         context_window=args.context_window,
         output_path=args.output,
