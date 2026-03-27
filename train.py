@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--val-every", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=2000)
     parser.add_argument("--checkpoint-every", type=int, default=0)
+    parser.add_argument("--resume-from-checkpoint", type=str, default=None)
     parser.add_argument("--intra-doc-mask", action="store_true")
     return parser.parse_args()
 
@@ -78,35 +79,103 @@ def make_intra_document_attn_mask(tokens: torch.Tensor, eot_token: int) -> torch
     return output.unsqueeze(1)
 
 
+def _checkpoint_path(step_num, checkpoint_run_name):
+    if checkpoint_run_name is not None:
+        return f"checkpoints/{checkpoint_run_name}/step_{step_num:06d}.pt"
+    return f"checkpoints/checkpoint_step_{step_num:06d}.pt"
+
+
+def _checkpoint_model(model, is_distributed):
+    checkpoint_model = model.module if is_distributed else model
+    return getattr(checkpoint_model, "_orig_mod", checkpoint_model)
+
+
+def _capture_rng_state():
+    state = {"torch": torch.random.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state()
+    return state
+
+
+def _restore_rng_state(state):
+    if state is None:
+        return
+    torch.random.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state(state["cuda"])
+
+
+def _gather_rank_state(local_state, *, is_distributed, world_size):
+    if not is_distributed:
+        return [local_state]
+    gathered_states = [None] * world_size
+    dist.all_gather_object(gathered_states, local_state)
+    return gathered_states
+
+
+def _move_optimizer_state_to_device(optimizer, device):
+    for state in optimizer.state.values():
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                state[key] = value.to(device)
+
+
+def _load_training_checkpoint(path):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Checkpoint file not found: {path}")
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _infer_checkpoint_run_name(resume_path):
+    if resume_path is None:
+        return None
+    checkpoint_root = os.path.abspath("checkpoints")
+    checkpoint_dir = os.path.dirname(os.path.abspath(resume_path))
+    if os.path.dirname(checkpoint_dir) == checkpoint_root:
+        return os.path.basename(checkpoint_dir)
+    return None
+
+
 def _save_checkpoint_if_needed(
     *,
     step,
     args,
     rank,
+    world_size,
     checkpoint_run_name,
     model,
     is_distributed,
     optimizer,
+    train_loader,
 ):
     if args.checkpoint_every <= 0 or (step + 1) % args.checkpoint_every != 0:
         return
+
+    step_num = step + 1
+    checkpoint_path = _checkpoint_path(step_num, checkpoint_run_name)
+
+    train_loader_state_dicts = _gather_rank_state(
+        train_loader.checkpoint(),
+        is_distributed=is_distributed,
+        world_size=world_size,
+    )
+    rng_state_dicts = _gather_rank_state(
+        _capture_rng_state(),
+        is_distributed=is_distributed,
+        world_size=world_size,
+    )
     if rank != 0:
         return
 
-    step_num = step + 1
-    if checkpoint_run_name is not None:
-        checkpoint_path = f"checkpoints/{checkpoint_run_name}/step_{step_num:06d}.pt"
-    else:
-        checkpoint_path = f"checkpoints/checkpoint_step_{step_num:06d}.pt"
-
     os.makedirs(os.path.dirname(checkpoint_path), exist_ok=True)
-
-    checkpoint_model = model.module if is_distributed else model
-    checkpoint_model = getattr(checkpoint_model, "_orig_mod", checkpoint_model)
+    checkpoint_model = _checkpoint_model(model, is_distributed)
     checkpoint = {
         "step": step_num,
         "model_state_dict": checkpoint_model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "train_loader_state_dicts": train_loader_state_dicts,
+        "rng_state_dicts": rng_state_dicts,
+        "world_size": world_size,
         "args": vars(args),
     }
     torch.save(checkpoint, checkpoint_path)
@@ -179,8 +248,7 @@ def _log_outlier_batches(
     )
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    checkpoint_model = model.module if is_distributed else model
-    checkpoint_model = getattr(checkpoint_model, "_orig_mod", checkpoint_model)
+    checkpoint_model = _checkpoint_model(model, is_distributed)
     torch.save(
         {
             "step": step_display,
@@ -252,54 +320,8 @@ def train(args):
         )
         if not checkpoint_run_name:
             checkpoint_run_name = "run"
-
-    # init the model, either from scratch or from OpenAI pretrained checkpoint
-    model = Model(
-        ModelConfig(
-            d_model=args.d_model,
-            n_kv_heads=args.n_kv_heads,
-            n_q_heads=args.n_q_heads,
-            n_layers=args.n_layers,
-            max_sequence_length=args.max_sequence_length,
-            vocab_size=args.vocab_size,
-            position_embedding_type=args.position_embedding_type,
-        )
-    )
-    model.train()
-    model.to(device)
-
-    tokenizer = tiktoken.get_encoding("gpt2")
-    eot_token_id = tokenizer.eot_token
-    if not args.no_compile:
-        model = torch.compile(model)
-
-    if is_distributed:
-        if device_type == "cuda":
-            model = DDP(model, device_ids=[rank])
-        else:
-            model = DDP(model)
-
-    # load dataset and stream-tokenize into packed batches
-    train_dataset_streams, val_dataset_streams = get_dataset(
-        num_shards=world_size, shard_index=rank
-    )
-    train_loader = DataLoader(
-        args.batch_size, args.seq_len, train_dataset_streams, args.data_buffer_size
-    )
-    val_loader = None
-    if args.val_every > 0:
-        val_loader = DataLoader(
-            args.batch_size, args.seq_len, val_dataset_streams, args.data_buffer_size
-        )
-
-    # init the optimizer
-    model_for_optim = model.module if is_distributed else model
-    optimizer = model_for_optim.configure_optimizers(
-        weight_decay=args.weight_decay,
-        learning_rate=args.learning_rate,
-        betas=(0.9, 0.95),
-        zero_stage=0,
-    )
+    elif args.resume_from_checkpoint is not None:
+        checkpoint_run_name = _infer_checkpoint_run_name(args.resume_from_checkpoint)
 
     min_lr = args.learning_rate * args.learning_rate_decay_frac
 
@@ -312,10 +334,98 @@ def train(args):
         if device_type == "cuda"
         else nullcontext()
     )
+    resume_checkpoint = None
+    start_step = 0
+    if args.resume_from_checkpoint is not None:
+        resume_checkpoint = _load_training_checkpoint(args.resume_from_checkpoint)
+        checkpoint_world_size = resume_checkpoint.get("world_size", 1)
+        if checkpoint_world_size != world_size:
+            raise ValueError(
+                "Checkpoint world_size does not match the current training world_size"
+            )
+        start_step = int(resume_checkpoint["step"])
 
     try:
+        # init the model, either from scratch or from a saved checkpoint
+        model = Model(
+            ModelConfig(
+                d_model=args.d_model,
+                n_kv_heads=args.n_kv_heads,
+                n_q_heads=args.n_q_heads,
+                n_layers=args.n_layers,
+                max_sequence_length=args.max_sequence_length,
+                vocab_size=args.vocab_size,
+                position_embedding_type=args.position_embedding_type,
+            )
+        )
+        if resume_checkpoint is not None:
+            model.load_state_dict(resume_checkpoint["model_state_dict"])
+        model.train()
+        model.to(device)
+
+        tokenizer = tiktoken.get_encoding("gpt2")
+        eot_token_id = tokenizer.eot_token
+        if not args.no_compile:
+            model = torch.compile(model)
+
+        if is_distributed:
+            if device_type == "cuda":
+                model = DDP(model, device_ids=[rank])
+            else:
+                model = DDP(model)
+
+        # load dataset and stream-tokenize into packed batches
+        train_dataset_streams, val_dataset_streams = get_dataset(
+            num_shards=world_size, shard_index=rank
+        )
+        train_loader = DataLoader(
+            args.batch_size, args.seq_len, train_dataset_streams, args.data_buffer_size
+        )
+        val_loader = None
+        if args.val_every > 0:
+            val_loader = DataLoader(
+                args.batch_size, args.seq_len, val_dataset_streams, args.data_buffer_size
+            )
+
+        # init the optimizer
+        model_for_optim = model.module if is_distributed else model
+        optimizer = model_for_optim.configure_optimizers(
+            weight_decay=args.weight_decay,
+            learning_rate=args.learning_rate,
+            betas=(0.9, 0.95),
+            zero_stage=0,
+        )
+        if resume_checkpoint is not None:
+            optimizer.load_state_dict(resume_checkpoint["optimizer_state_dict"])
+            _move_optimizer_state_to_device(optimizer, device)
+
+            train_loader_states = resume_checkpoint.get("train_loader_state_dicts")
+            if train_loader_states is not None:
+                if len(train_loader_states) != world_size:
+                    raise ValueError(
+                        "Checkpoint dataloader state does not match the current world_size"
+                    )
+                train_loader.load_checkpoint(train_loader_states[rank])
+            elif rank == 0:
+                print(
+                    "Checkpoint does not include dataloader state; restarting dataloader from the beginning."
+                )
+
+            rng_state_dicts = resume_checkpoint.get("rng_state_dicts")
+            if rng_state_dicts is not None:
+                if len(rng_state_dicts) != world_size:
+                    raise ValueError(
+                        "Checkpoint RNG state does not match the current world_size"
+                    )
+                _restore_rng_state(rng_state_dicts[rank])
+
+            if rank == 0:
+                print(
+                    f"Resuming training from {args.resume_from_checkpoint} at step {start_step}"
+                )
+
         with autocast_context:
-            for step in range(args.num_iterations + 1):
+            for step in range(start_step, args.num_iterations + 1):
                 t0 = time.time()
                 # --------------- TRAINING SECTION BEGIN -----------------
                 model.train()
@@ -459,16 +569,22 @@ def train(args):
                     step=step,
                     args=args,
                     rank=rank,
+                    world_size=world_size,
                     checkpoint_run_name=checkpoint_run_name,
                     model=model,
                     is_distributed=is_distributed,
                     optimizer=optimizer,
+                    train_loader=train_loader,
                 )
 
                 # keep track of smooth timings, last 20 iterations
                 if step > 0 and step > args.num_iterations - 20:
                     timings.append(t1 - t0)
     finally:
+        if "train_loader" in locals():
+            train_loader.close()
+        if "val_loader" in locals() and val_loader is not None:
+            val_loader.close()
         if wandb_run is not None:
             wandb_run.finish()
         if is_distributed:

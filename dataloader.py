@@ -1,3 +1,4 @@
+import copy
 import queue
 import random
 import threading
@@ -184,7 +185,12 @@ def get_dataset(*, num_shards=1, shard_index=0, skip_examples=0):
     train_streams = [train_stream for train_stream, _ in stream_pairs]
     validation_streams = [validation_stream for _, validation_stream in stream_pairs]
     return train_streams, validation_streams
+
+
 class DataLoader:
+    _CHECKPOINT_VERSION = 1
+    _SAMPLE_QUEUE_SIZE = 8
+
     def __init__(self, batch_size, seq_len, dataset_streams, buffer_size):
         if batch_size <= 0:
             raise ValueError("batch_size must be > 0")
@@ -206,16 +212,25 @@ class DataLoader:
                 f"ratios ({total_ratio})"
             )
         scale = self.batch_size // total_ratio
-        self._examples_per_batch = [scale * stream.ratio for stream in self.dataset_streams]
+        self._examples_per_batch = [
+            scale * stream.ratio for stream in self.dataset_streams
+        ]
 
         self._enc = tiktoken.get_encoding("gpt2")
         self.eot_token = self._enc.eot_token
 
-        self._dataset_iters = [iter(stream.dataset) for stream in self.dataset_streams]
-        self._token_buffers = [[] for _ in self.dataset_streams]
-        self._sample_queues = [queue.Queue(maxsize=8) for _ in self.dataset_streams]
-        self._batch_queue = queue.Queue(maxsize=self.buffer_size)
-        self._stop_event = threading.Event()
+        self._pending_samples = [None for _ in self.dataset_streams]
+        self._pending_batch = None
+        self._reset_runtime_state()
+        self._start_threads()
+
+    def _make_sample_queues(self):
+        return [
+            queue.Queue(maxsize=self._SAMPLE_QUEUE_SIZE)
+            for _ in self.dataset_streams
+        ]
+
+    def _start_threads(self):
         self._fetcher_threads = [
             threading.Thread(
                 target=self._fetcher_loop,
@@ -231,6 +246,15 @@ class DataLoader:
         for fetcher_thread in self._fetcher_threads:
             fetcher_thread.start()
         self._producer_thread.start()
+
+    def _reset_runtime_state(self):
+        self._stop_event = threading.Event()
+        self._dataset_iters = [iter(stream.dataset) for stream in self.dataset_streams]
+        self._token_buffers = [[] for _ in self.dataset_streams]
+        self._sample_queues = self._make_sample_queues()
+        self._batch_queue = queue.Queue(maxsize=self.buffer_size)
+        self._pending_samples = [None for _ in self.dataset_streams]
+        self._pending_batch = None
 
     def _next_sample(self, dataset_idx):
         while True:
@@ -257,10 +281,17 @@ class DataLoader:
     def _fetcher_loop(self, dataset_idx):
         try:
             while not self._stop_event.is_set():
-                sample = self._next_sample(dataset_idx)
-                self._put_with_stop(self._sample_queues[dataset_idx], sample)
+                sample = self._pending_samples[dataset_idx]
+                if sample is None:
+                    sample = self._next_sample(dataset_idx)
+                    self._pending_samples[dataset_idx] = sample
+                if not self._put_with_stop(self._sample_queues[dataset_idx], sample):
+                    return
+                self._pending_samples[dataset_idx] = None
         finally:
-            self._put_with_stop(self._sample_queues[dataset_idx], self._SAMPLE_END)
+            if not self._stop_event.is_set():
+                self._pending_samples[dataset_idx] = None
+                self._put_with_stop(self._sample_queues[dataset_idx], self._SAMPLE_END)
 
     def _fill_token_buffer(self, dataset_idx, min_tokens):
         token_buffer = self._token_buffers[dataset_idx]
@@ -280,6 +311,7 @@ class DataLoader:
     def _build_batch(self):
         x_parts = []
         y_parts = []
+        next_token_buffers = []
 
         for dataset_idx in range(len(self.dataset_streams)):
             n_examples = self._examples_per_batch[dataset_idx]
@@ -290,13 +322,14 @@ class DataLoader:
                 raise StopIteration
 
             flat = token_buffer[:dataset_tokens_per_batch]
-            self._token_buffers[dataset_idx] = token_buffer[dataset_tokens_per_batch:]
+            next_token_buffers.append(token_buffer[dataset_tokens_per_batch:])
             flat = torch.tensor(flat, dtype=torch.long)
             x_part = flat[:-1].view(n_examples, self.seq_len)
             y_part = flat[1:].view(n_examples, self.seq_len)
             x_parts.append(x_part)
             y_parts.append(y_part)
 
+        self._token_buffers = next_token_buffers
         x = torch.cat(x_parts, dim=0)
         y = torch.cat(y_parts, dim=0)
         return x, y
@@ -304,12 +337,19 @@ class DataLoader:
     def _producer_loop(self):
         try:
             while not self._stop_event.is_set():
-                batch = self._build_batch()
+                batch = self._pending_batch
+                if batch is None:
+                    batch = self._build_batch()
+                    self._pending_batch = batch
                 # Block only when queue is full (backpressure); otherwise emit immediately
                 if not self._put_with_stop(self._batch_queue, batch):
                     return
+                self._pending_batch = None
         except StopIteration:
             pass
+        finally:
+            if not self._stop_event.is_set():
+                self._pending_batch = None
 
     def __iter__(self):
         return self
@@ -334,28 +374,106 @@ class DataLoader:
         if self._producer_thread.is_alive():
             self._producer_thread.join(timeout=1.0)
 
-    def reset(self):
+    def _drain_queue(self, q, *, drop_sample_end=False):
+        items = []
+        while True:
+            try:
+                item = q.get_nowait()
+            except queue.Empty:
+                break
+            if drop_sample_end and item is self._SAMPLE_END:
+                continue
+            items.append(item)
+        return items
+
+    def _restore_queue(self, q, items):
+        for item in items:
+            q.put_nowait(item)
+
+    def checkpoint(self):
         self.close()
+
+        sample_queue_contents = [
+            self._drain_queue(sample_queue, drop_sample_end=True)
+            for sample_queue in self._sample_queues
+        ]
+        batch_queue_contents = self._drain_queue(self._batch_queue)
+
+        checkpoint = {
+            "version": self._CHECKPOINT_VERSION,
+            "batch_size": self.batch_size,
+            "seq_len": self.seq_len,
+            "buffer_size": self.buffer_size,
+            "dataset_sources": [stream.source for stream in self.dataset_streams],
+            "dataset_state_dicts": [
+                stream.dataset.state_dict() for stream in self.dataset_streams
+            ],
+            "token_buffers": copy.deepcopy(self._token_buffers),
+            "sample_queues": copy.deepcopy(sample_queue_contents),
+            "pending_samples": copy.deepcopy(self._pending_samples),
+            "batch_queue": copy.deepcopy(batch_queue_contents),
+            "pending_batch": copy.deepcopy(self._pending_batch),
+        }
+
+        self.load_checkpoint(copy.deepcopy(checkpoint))
+        return checkpoint
+
+    def load_checkpoint(self, checkpoint):
+        if checkpoint.get("version") != self._CHECKPOINT_VERSION:
+            raise ValueError("Unsupported dataloader checkpoint version")
+        if checkpoint.get("batch_size") != self.batch_size:
+            raise ValueError("Checkpoint batch_size does not match dataloader")
+        if checkpoint.get("seq_len") != self.seq_len:
+            raise ValueError("Checkpoint seq_len does not match dataloader")
+        if checkpoint.get("buffer_size") != self.buffer_size:
+            raise ValueError("Checkpoint buffer_size does not match dataloader")
+
+        dataset_sources = [stream.source for stream in self.dataset_streams]
+        if checkpoint.get("dataset_sources") != dataset_sources:
+            raise ValueError("Checkpoint dataset streams do not match dataloader")
+
+        dataset_state_dicts = checkpoint.get("dataset_state_dicts")
+        token_buffers = checkpoint.get("token_buffers")
+        sample_queues = checkpoint.get("sample_queues")
+        pending_samples = checkpoint.get("pending_samples")
+        batch_queue = checkpoint.get("batch_queue")
+        pending_batch = checkpoint.get("pending_batch")
+        if dataset_state_dicts is None or token_buffers is None:
+            raise ValueError("Checkpoint is missing dataloader state")
+        if sample_queues is None or pending_samples is None:
+            raise ValueError("Checkpoint is missing sample queue state")
+        if batch_queue is None:
+            raise ValueError("Checkpoint is missing batch queue state")
+        if len(dataset_state_dicts) != len(self.dataset_streams):
+            raise ValueError("Checkpoint dataset state does not match dataloader")
+        if len(token_buffers) != len(self.dataset_streams):
+            raise ValueError("Checkpoint token buffers do not match dataloader")
+        if len(sample_queues) != len(self.dataset_streams):
+            raise ValueError("Checkpoint sample queues do not match dataloader")
+        if len(pending_samples) != len(self.dataset_streams):
+            raise ValueError("Checkpoint pending samples do not match dataloader")
+
+        self.close()
+        for stream, dataset_state in zip(self.dataset_streams, dataset_state_dicts):
+            stream.dataset.load_state_dict(dataset_state)
+
         self._stop_event = threading.Event()
         self._dataset_iters = [iter(stream.dataset) for stream in self.dataset_streams]
-        self._token_buffers = [[] for _ in self.dataset_streams]
-        self._sample_queues = [queue.Queue(maxsize=8) for _ in self.dataset_streams]
+        self._token_buffers = [list(token_buffer) for token_buffer in token_buffers]
+        self._sample_queues = self._make_sample_queues()
         self._batch_queue = queue.Queue(maxsize=self.buffer_size)
-        self._fetcher_threads = [
-            threading.Thread(
-                target=self._fetcher_loop,
-                args=(dataset_idx,),
-                daemon=True,
-                name=f"dataloader-fetcher-{dataset_idx}",
-            )
-            for dataset_idx in range(len(self.dataset_streams))
-        ]
-        self._producer_thread = threading.Thread(
-            target=self._producer_loop, daemon=True, name="dataloader-producer"
-        )
-        for fetcher_thread in self._fetcher_threads:
-            fetcher_thread.start()
-        self._producer_thread.start()
+        self._pending_samples = list(pending_samples)
+        self._pending_batch = pending_batch
+
+        for sample_queue_obj, sample_items in zip(self._sample_queues, sample_queues):
+            self._restore_queue(sample_queue_obj, sample_items)
+        self._restore_queue(self._batch_queue, batch_queue)
+        self._start_threads()
+
+    def reset(self):
+        self.close()
+        self._reset_runtime_state()
+        self._start_threads()
 
 
 if __name__ == "__main__":
