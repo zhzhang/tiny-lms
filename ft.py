@@ -282,8 +282,6 @@ def load_and_prepare_datasets(
         args.dataset_name,
         split=args.dataset_split,
         streaming=True,
-        shuffle=True,
-        seed=42,
     )
     dataset = dataset.map(
         normalize_example,
