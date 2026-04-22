@@ -3,7 +3,7 @@ import json
 from typing import Any
 
 import torch
-from datasets import Dataset, load_dataset
+from datasets import IterableDataset, load_dataset
 from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForCausalLM,
@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset-split",
         type=str,
         default="train",
-        help="Dataset split to load before making a local eval split.",
+        help="Dataset split to load for training.",
     )
     parser.add_argument(
         "--output-dir",
@@ -53,12 +53,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Per-device train batch size.",
-    )
-    parser.add_argument(
-        "--per-device-eval-batch-size",
-        type=int,
-        default=1,
-        help="Per-device eval batch size.",
     )
     parser.add_argument(
         "--gradient-accumulation-steps",
@@ -99,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=-1,
+        default=10000,
         help="If > 0, overrides num_train_epochs.",
     )
     parser.add_argument(
@@ -109,34 +103,16 @@ def parse_args() -> argparse.Namespace:
         help="Logging frequency in optimizer steps.",
     )
     parser.add_argument(
-        "--eval-steps",
-        type=int,
-        default=250,
-        help="Evaluation frequency in optimizer steps.",
-    )
-    parser.add_argument(
         "--save-total-limit",
         type=int,
         default=2,
         help="Maximum number of checkpoints to keep.",
     )
     parser.add_argument(
-        "--eval-size",
-        type=int,
-        default=2000,
-        help="Number of held-out examples for evaluation. Use 0 to disable eval.",
-    )
-    parser.add_argument(
         "--max-train-samples",
         type=int,
         default=None,
         help="Optional cap on train examples for quick experiments.",
-    )
-    parser.add_argument(
-        "--max-eval-samples",
-        type=int,
-        default=None,
-        help="Optional cap on eval examples.",
     )
     parser.add_argument(
         "--dataset-num-proc",
@@ -269,15 +245,15 @@ def is_trainable_example(example: dict[str, Any]) -> bool:
     return bool(messages[-1]["content"].strip())
 
 
-def maybe_limit(dataset: Dataset, limit: int | None) -> Dataset:
+def maybe_limit(dataset: IterableDataset, limit: int | None) -> IterableDataset:
     if limit is None:
         return dataset
-    return dataset.select(range(min(limit, len(dataset))))
+    return dataset.take(limit)
 
 
 def load_and_prepare_datasets(
     args: argparse.Namespace,
-) -> tuple[Dataset, Dataset | None]:
+) -> IterableDataset:
     dataset = load_dataset(
         args.dataset_name,
         split=args.dataset_split,
@@ -286,29 +262,13 @@ def load_and_prepare_datasets(
     dataset = dataset.map(
         normalize_example,
         remove_columns=dataset.column_names,
-        num_proc=args.dataset_num_proc,
-        desc="Normalizing conversational messages",
     )
     dataset = dataset.filter(
         is_trainable_example,
-        num_proc=args.dataset_num_proc,
-        desc="Filtering valid SFT conversations",
     )
 
-    if args.eval_size > 0:
-        eval_size = min(args.eval_size, max(1, len(dataset) - 1))
-        split_dataset = dataset.train_test_split(test_size=eval_size, seed=args.seed)
-        train_dataset = split_dataset["train"]
-        eval_dataset = split_dataset["test"]
-    else:
-        train_dataset = dataset
-        eval_dataset = None
-
-    train_dataset = maybe_limit(train_dataset, args.max_train_samples)
-    if eval_dataset is not None:
-        eval_dataset = maybe_limit(eval_dataset, args.max_eval_samples)
-
-    return train_dataset, eval_dataset
+    dataset = maybe_limit(dataset, args.max_train_samples)
+    return dataset
 
 
 def find_lora_target_modules(model: torch.nn.Module) -> list[str]:
@@ -422,7 +382,7 @@ def load_model_and_tokenizer(
 
 
 def build_trainer(args: argparse.Namespace) -> SFTTrainer:
-    train_dataset, eval_dataset = load_and_prepare_datasets(args)
+    train_dataset = load_and_prepare_datasets(args)
     model, tokenizer, target_modules = load_model_and_tokenizer(args)
     effective_max_length = args.max_seq_length
     model_max_length = infer_model_max_length(model)
@@ -444,7 +404,6 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         packing=args.packing,
         assistant_only_loss=args.assistant_only_loss,
         per_device_train_batch_size=args.per_device_train_batch_size,
-        per_device_eval_batch_size=args.per_device_eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -453,8 +412,7 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps,
         logging_steps=args.logging_steps,
-        eval_steps=args.eval_steps if eval_dataset is not None else None,
-        eval_strategy="steps" if eval_dataset is not None else "no",
+        eval_strategy="no",
         save_strategy="no",
         save_total_limit=args.save_total_limit,
         gradient_checkpointing=args.gradient_checkpointing,
@@ -480,9 +438,6 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         target_modules=target_modules,
     )
 
-    print(f"Train examples: {len(train_dataset):,}")
-    if eval_dataset is not None:
-        print(f"Eval examples:  {len(eval_dataset):,}")
     print(f"Max sequence length: {effective_max_length}")
     print(f"LoRA target modules: {target_modules}")
 
@@ -490,7 +445,6 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
     )
