@@ -5,7 +5,12 @@ from typing import Any
 import torch
 from datasets import Dataset, load_dataset
 from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, set_seed
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BitsAndBytesConfig,
+    set_seed,
+)
 from trl import SFTConfig, SFTTrainer
 
 
@@ -102,12 +107,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=10,
         help="Logging frequency in optimizer steps.",
-    )
-    parser.add_argument(
-        "--save-steps",
-        type=int,
-        default=250,
-        help="Checkpoint save frequency in optimizer steps.",
     )
     parser.add_argument(
         "--eval-steps",
@@ -276,7 +275,9 @@ def maybe_limit(dataset: Dataset, limit: int | None) -> Dataset:
     return dataset.select(range(min(limit, len(dataset))))
 
 
-def load_and_prepare_datasets(args: argparse.Namespace) -> tuple[Dataset, Dataset | None]:
+def load_and_prepare_datasets(
+    args: argparse.Namespace,
+) -> tuple[Dataset, Dataset | None]:
     dataset = load_dataset(args.dataset_name, split=args.dataset_split)
     dataset = dataset.map(
         normalize_example,
@@ -390,7 +391,9 @@ def load_model_and_tokenizer(
     if args.load_in_4bit:
         if not torch.cuda.is_available():
             raise ValueError("--load-in-4bit requires CUDA.")
-        quant_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        quant_dtype = (
+            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        )
         model_kwargs["quantization_config"] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
@@ -446,10 +449,9 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         num_train_epochs=args.num_train_epochs,
         max_steps=args.max_steps,
         logging_steps=args.logging_steps,
-        save_steps=args.save_steps,
         eval_steps=args.eval_steps if eval_dataset is not None else None,
         eval_strategy="steps" if eval_dataset is not None else "no",
-        save_strategy="steps",
+        save_strategy="no",
         save_total_limit=args.save_total_limit,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
