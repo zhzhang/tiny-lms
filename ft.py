@@ -198,6 +198,23 @@ def pick_dtype() -> torch.dtype:
     return torch.float16
 
 
+def reconcile_tf32_apis() -> None:
+    # In PyTorch >= 2.9, transformers' TrainingArguments sets TF32 through the
+    # new `torch.backends.fp32_precision` setter when torch_compile is enabled.
+    # However torch._inductor.compile_fx._warn_tf32_disabled still reads the
+    # legacy `torch.backends.cuda.matmul.allow_tf32` getter, which raises a
+    # RuntimeError complaining that the legacy and new APIs were mixed. Calling
+    # the legacy setters here marks the legacy API as explicitly used, which
+    # keeps the two APIs in sync and lets the inductor read path succeed.
+    if not torch.cuda.is_available():
+        return
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        pass
+
+
 def normalize_content(content: Any) -> str:
     if content is None:
         return ""
@@ -333,7 +350,6 @@ def find_lora_target_modules(model: torch.nn.Module) -> list[str]:
 
 def ensure_chat_template(tokenizer: Any) -> None:
     if getattr(tokenizer, "chat_template", None):
-        print(tokenizer.chat_template)
         return
 
     # This fallback keeps the dataset in conversational format for SFTTrainer
@@ -380,7 +396,7 @@ def load_model_and_tokenizer(
         "low_cpu_mem_usage": True,
     }
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, attn_implementation="flash_attention_2", **model_kwargs)
     if args.gradient_checkpointing:
         model.config.use_cache = False
         if hasattr(model, "enable_input_require_grads"):
@@ -432,13 +448,13 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         gradient_checkpointing_kwargs={"use_reentrant": False},
         bf16=dtype == torch.bfloat16,
         fp16=dtype == torch.float16,
-        dataloader_num_workers=2,
+        dataloader_num_workers=8,
         dataset_num_proc=args.dataset_num_proc,
         report_to=report_to,
         run_name=args.wandb_run_name,
         seed=args.seed,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
-        torch_compile=args.torch_compile,
+        # torch_compile=args.torch_compile,
         remove_unused_columns=False,
         eos_token=tokenizer.eos_token,
     )
@@ -460,14 +476,8 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         args=sft_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
-        peft_config=peft_config,
+        # peft_config=peft_config,
     )
-    for batch in trainer.get_train_dataloader():
-        print(batch.keys())
-        print(batch["input_ids"].shape)
-        # Print the first sample in the batch
-        print(tokenizer.decode(batch["input_ids"][0]))
-        break # Only print one batch
     return trainer
 
 
@@ -475,6 +485,7 @@ def main() -> None:
     args = parse_args()
     set_seed(args.seed)
     trainer = build_trainer(args)
+    reconcile_tf32_apis()
     trainer.train(resume_from_checkpoint=args.resume_from_checkpoint)
     trainer.save_model()
     trainer.processing_class.save_pretrained(args.output_dir)
