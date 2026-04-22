@@ -278,7 +278,13 @@ def maybe_limit(dataset: Dataset, limit: int | None) -> Dataset:
 def load_and_prepare_datasets(
     args: argparse.Namespace,
 ) -> tuple[Dataset, Dataset | None]:
-    dataset = load_dataset(args.dataset_name, split=args.dataset_split)
+    dataset = load_dataset(
+        args.dataset_name,
+        split=args.dataset_split,
+        streaming=True,
+        shuffle=True,
+        seed=42,
+    )
     dataset = dataset.map(
         normalize_example,
         remove_columns=dataset.column_names,
