@@ -1,9 +1,10 @@
 import argparse
 import json
+from itertools import accumulate
 from typing import Any
 
 import torch
-from datasets import IterableDataset, load_dataset
+from datasets import Dataset, load_dataset
 from peft import LoraConfig, TaskType, prepare_model_for_kbit_training
 from transformers import (
     AutoModelForCausalLM,
@@ -99,20 +100,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logging-steps",
         type=int,
-        default=10,
+        default=1,
         help="Logging frequency in optimizer steps.",
-    )
-    parser.add_argument(
-        "--save-total-limit",
-        type=int,
-        default=2,
-        help="Maximum number of checkpoints to keep.",
     )
     parser.add_argument(
         "--max-train-samples",
         type=int,
         default=None,
         help="Optional cap on train examples for quick experiments.",
+    )
+    parser.add_argument(
+        "--max-train-tokens",
+        type=int,
+        default=10_000_000,
+        help="Approximate token budget to sample after filtering/shuffling.",
     )
     parser.add_argument(
         "--dataset-num-proc",
@@ -137,16 +138,6 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.05,
         help="LoRA dropout.",
-    )
-    parser.add_argument(
-        "--load-in-4bit",
-        action="store_true",
-        help="Use 4-bit loading for lower VRAM at the cost of extra complexity.",
-    )
-    parser.add_argument(
-        "--packing",
-        action="store_true",
-        help="Enable example packing for better throughput.",
     )
     parser.add_argument(
         "--assistant-only-loss",
@@ -189,6 +180,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Resume from a previous Trainer checkpoint.",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compile the model with torch.compile for faster training.",
     )
     return parser.parse_args()
 
@@ -236,7 +233,9 @@ def normalize_example(example: dict[str, Any]) -> dict[str, Any]:
     return {"messages": cleaned_messages}
 
 
-def is_trainable_example(example: dict[str, Any]) -> bool:
+def is_trainable_example(
+    example: dict[str, Any],
+) -> bool:
     messages = example["messages"]
     if len(messages) < 2:
         return False
@@ -245,29 +244,57 @@ def is_trainable_example(example: dict[str, Any]) -> bool:
     return bool(messages[-1]["content"].strip())
 
 
-def maybe_limit(dataset: IterableDataset, limit: int | None) -> IterableDataset:
+def maybe_limit(dataset: Dataset, limit: int | None) -> Dataset:
     if limit is None:
         return dataset
-    return dataset.take(limit)
+    return dataset.select(range(min(limit, len(dataset))))
+
+
+def get_num_tokens(example: dict[str, Any], tokenizer: Any) -> dict[str, int]:
+    token_ids = tokenizer.apply_chat_template(
+        example["messages"],
+        tokenize=True,
+        add_generation_prompt=False,
+    )
+    return {"num_tokens": len(token_ids)}
+
+
+def is_within_max_tokens(example: dict[str, Any], max_length: int) -> bool:
+    return example["num_tokens"] <= max_length
+
+
+def take_token_budget(dataset: Dataset, token_budget: int) -> Dataset:
+    if token_budget <= 0 or len(dataset) == 0:
+        return dataset.select([])
+
+    token_counts = dataset["num_tokens"]
+    cumulative = accumulate(token_counts)
+    keep_count = 0
+    for running_total in cumulative:
+        if running_total > token_budget:
+            break
+        keep_count += 1
+    return dataset.select(range(keep_count))
 
 
 def load_and_prepare_datasets(
     args: argparse.Namespace,
-) -> IterableDataset:
+    tokenizer: Any,
+    max_length: int,
+) -> Dataset:
     dataset = load_dataset(
         args.dataset_name,
         split=args.dataset_split,
-        streaming=True,
-    )
+    ).select(range(100_000))
     dataset = dataset.map(
         normalize_example,
         remove_columns=dataset.column_names,
+        num_proc=args.dataset_num_proc,
     )
     dataset = dataset.filter(
         is_trainable_example,
+        num_proc=args.dataset_num_proc,
     )
-
-    dataset = maybe_limit(dataset, args.max_train_samples)
     return dataset
 
 
@@ -306,6 +333,7 @@ def find_lora_target_modules(model: torch.nn.Module) -> list[str]:
 
 def ensure_chat_template(tokenizer: Any) -> None:
     if getattr(tokenizer, "chat_template", None):
+        print(tokenizer.chat_template)
         return
 
     # This fallback keeps the dataset in conversational format for SFTTrainer
@@ -352,29 +380,10 @@ def load_model_and_tokenizer(
         "low_cpu_mem_usage": True,
     }
 
-    if args.load_in_4bit:
-        if not torch.cuda.is_available():
-            raise ValueError("--load-in-4bit requires CUDA.")
-        quant_dtype = (
-            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        )
-        model_kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=quant_dtype,
-        )
-        model_kwargs["device_map"] = {"": 0}
-
     model = AutoModelForCausalLM.from_pretrained(args.model_name, **model_kwargs)
     if args.gradient_checkpointing:
         model.config.use_cache = False
-        if args.load_in_4bit:
-            model = prepare_model_for_kbit_training(
-                model,
-                use_gradient_checkpointing=True,
-            )
-        elif hasattr(model, "enable_input_require_grads"):
+        if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
 
     target_modules = find_lora_target_modules(model)
@@ -382,12 +391,16 @@ def load_model_and_tokenizer(
 
 
 def build_trainer(args: argparse.Namespace) -> SFTTrainer:
-    train_dataset = load_and_prepare_datasets(args)
     model, tokenizer, target_modules = load_model_and_tokenizer(args)
     effective_max_length = args.max_seq_length
     model_max_length = infer_model_max_length(model)
     if model_max_length is not None:
         effective_max_length = min(effective_max_length, model_max_length)
+    train_dataset = load_and_prepare_datasets(
+        args,
+        tokenizer=tokenizer,
+        max_length=effective_max_length,
+    )
 
     report_to = "wandb" if args.wandb_project else "none"
     if args.wandb_project:
@@ -401,8 +414,9 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
     sft_config = SFTConfig(
         output_dir=args.output_dir,
         max_length=effective_max_length,
-        packing=args.packing,
-        assistant_only_loss=args.assistant_only_loss,
+        packing=True,
+        # assistant_only_loss=args.assistant_only_loss,
+        completion_only_loss=True,
         per_device_train_batch_size=args.per_device_train_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         learning_rate=args.learning_rate,
@@ -414,7 +428,6 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         logging_steps=args.logging_steps,
         eval_strategy="no",
         save_strategy="no",
-        save_total_limit=args.save_total_limit,
         gradient_checkpointing=args.gradient_checkpointing,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         bf16=dtype == torch.bfloat16,
@@ -425,6 +438,7 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
         run_name=args.wandb_run_name,
         seed=args.seed,
         optim="adamw_torch_fused" if torch.cuda.is_available() else "adamw_torch",
+        torch_compile=args.torch_compile,
         remove_unused_columns=False,
         eos_token=tokenizer.eos_token,
     )
@@ -441,13 +455,20 @@ def build_trainer(args: argparse.Namespace) -> SFTTrainer:
     print(f"Max sequence length: {effective_max_length}")
     print(f"LoRA target modules: {target_modules}")
 
-    return SFTTrainer(
+    trainer = SFTTrainer(
         model=model,
         args=sft_config,
         train_dataset=train_dataset,
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+    for batch in trainer.get_train_dataloader():
+        print(batch.keys())
+        print(batch["input_ids"].shape)
+        # Print the first sample in the batch
+        print(tokenizer.decode(batch["input_ids"][0]))
+        break # Only print one batch
+    return trainer
 
 
 def main() -> None:
