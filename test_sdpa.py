@@ -24,6 +24,7 @@ def _assert_close(actual, expected, atol=1e-5, rtol=1e-5):
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(autouse=True)
 def seed():
     torch.manual_seed(SEED)
@@ -32,6 +33,7 @@ def seed():
 # ---------------------------------------------------------------------------
 # Basic shapes
 # ---------------------------------------------------------------------------
+
 
 class TestBasicShapes:
     """Q, K, V with matching dims, no optional args."""
@@ -76,6 +78,7 @@ class TestBasicShapes:
 # Asymmetric shapes
 # ---------------------------------------------------------------------------
 
+
 class TestAsymmetricShapes:
     """Q and K can differ in seq length; V can differ in embed dim."""
 
@@ -119,6 +122,7 @@ class TestAsymmetricShapes:
 # ---------------------------------------------------------------------------
 # Attention masks
 # ---------------------------------------------------------------------------
+
 
 class TestAttnMask:
     """Boolean and float attention masks in various shapes."""
@@ -243,6 +247,7 @@ class TestAttnMask:
 # Causal masking
 # ---------------------------------------------------------------------------
 
+
 class TestCausal:
     """is_causal=True generates a lower-triangular mask."""
 
@@ -300,6 +305,7 @@ class TestCausal:
 # ---------------------------------------------------------------------------
 # Scale
 # ---------------------------------------------------------------------------
+
 
 class TestScale:
     """Custom scale factor (keyword-only arg)."""
@@ -364,6 +370,7 @@ class TestScale:
 # ---------------------------------------------------------------------------
 # Grouped Query Attention (GQA)
 # ---------------------------------------------------------------------------
+
 
 class TestGQA:
     """enable_gqa=True — query heads are a multiple of key/value heads."""
@@ -450,6 +457,7 @@ class TestGQA:
 # Dropout (shape-only — values are non-deterministic)
 # ---------------------------------------------------------------------------
 
+
 class TestDropout:
     """Dropout can't be tested for exact values; verify shape & no crash."""
 
@@ -480,6 +488,7 @@ class TestDropout:
 # ---------------------------------------------------------------------------
 # Combined kwargs
 # ---------------------------------------------------------------------------
+
 
 class TestCombinations:
     """Multiple optional args used together."""
@@ -527,6 +536,7 @@ class TestCombinations:
 # Output shape
 # ---------------------------------------------------------------------------
 
+
 class TestOutputShape:
     """Verify output tensor shapes across configurations."""
 
@@ -552,6 +562,7 @@ class TestOutputShape:
 # Numerical properties
 # ---------------------------------------------------------------------------
 
+
 class TestNumericalProperties:
     """Sanity-check numerical behavior."""
 
@@ -562,9 +573,7 @@ class TestNumericalProperties:
         v_identity = torch.zeros(1, 1, 6, 1)
         v_identity[..., :, 0] = 1.0
         out = my_sdpa(q, k, v_identity)
-        torch.testing.assert_close(
-            out.squeeze(), torch.ones(4), atol=1e-5, rtol=1e-5
-        )
+        torch.testing.assert_close(out.squeeze(), torch.ones(4), atol=1e-5, rtol=1e-5)
 
     def test_identical_keys_uniform_attention(self):
         """If all keys are identical, attention should be uniform."""
@@ -587,6 +596,7 @@ class TestNumericalProperties:
 # ---------------------------------------------------------------------------
 # Error cases
 # ---------------------------------------------------------------------------
+
 
 class TestErrors:
     """Verify that invalid inputs raise errors (matching PyTorch behavior)."""
@@ -642,6 +652,7 @@ class TestErrors:
 # ---------------------------------------------------------------------------
 # Dtype handling
 # ---------------------------------------------------------------------------
+
 
 class TestDtypes:
     """Verify behavior across float dtypes."""
