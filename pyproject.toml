@@ -31,5 +31,6 @@ flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheel
 
 [dependency-groups]
 dev = [
+    "pytest>=9.0.3",
     "snakeviz>=2.2.2",
 ]
