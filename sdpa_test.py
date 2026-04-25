@@ -32,13 +32,21 @@ def my_sdpa(
     Returns:
         (N, ..., Hq, L, Ev)
     """
+    assert len(query.shape) > 1 and len(key.shape) > 1 and len(value.shape) > 1
     *q_shapes, q_seq, q_dim = query.shape
     *k_shapes, k_seq, k_dim = key.shape
-    n_dims = len(q_shapes)
-    # if enable_gqa:
-    #     assert q_head >= k_head and q_head % k_head == 0
-    # else:
-    #     assert q_head == k_head
+    assert q_dim == k_dim
+    *v_shapes, v_seq, v_dim = value.shape
+
+    no_extra_dims = len(q_shapes) == 0 and len(k_shapes) == 0 and len(v_shapes) == 0
+    q_head = None if no_extra_dims else q_shapes[-1]
+    k_head = None if no_extra_dims else k_shapes[-1]
+    v_head = None if no_extra_dims else v_shapes[-1]
+
+    assert no_extra_dims or (q_shapes[0] == v_shapes[0] and q_shapes[0] == k_shapes[0])
+
+    assert k_seq == v_seq
+    output_shape = (*q_shapes, q_seq, v_dim)
 
     # Two no mask cases.
     if is_causal:
@@ -53,11 +61,24 @@ def my_sdpa(
     else:
         attn_bias = attn_mask
 
-    print(attn_mask)
-    print(attn_bias)
+    if enable_gqa:
+        assert q_head >= k_head and q_head % k_head == 0
+        n_q_per_k = q_head // k_head
+        query = query.reshape(*q_shapes[:-1], k_head, n_q_per_k, q_seq, q_dim)
+        key = key.unsqueeze(-3)
+    else:
+        assert q_head == k_head and q_head == v_head
+
     attn = torch.einsum("...le,...se->...ls", query, key)
     attn *= scale if scale is not None else 1 / math.sqrt(q_dim)
     attn = attn + attn_bias
     attn = attn.softmax(-1)
-    out = torch.einsum("...qv,...ve->...qe", attn, value)
+    if enable_gqa:
+        q_head = q_shapes[-1]
+        v_head = v_shapes[-1]
+        assert q_head >= v_head and q_head % v_head == 0
+        n_q_per_v = q_head // v_head
+        attn = attn.reshape(*q_shapes[:-1], v_head, n_q_per_v, q_seq, k_seq)
+        value = value.unsqueeze(-3)
+    out = torch.einsum("...qv,...ve->...qe", attn, value).reshape(output_shape)
     return out

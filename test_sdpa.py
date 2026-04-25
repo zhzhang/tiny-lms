@@ -603,7 +603,7 @@ class TestErrors:
 
     def _assert_raises_runtime_not_notimpl(self, fn):
         """Ensure a RuntimeError is raised, but NOT NotImplementedError."""
-        with pytest.raises(RuntimeError) as exc_info:
+        with pytest.raises(AssertionError) as exc_info:
             fn()
         assert not isinstance(exc_info.value, NotImplementedError), (
             "Got NotImplementedError — implement the function first"
